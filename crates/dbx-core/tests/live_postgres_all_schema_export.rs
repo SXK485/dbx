@@ -96,6 +96,7 @@ async fn live_postgres_all_schema_export_restores_one_sql_file() {
     export_database_sql_core(
         &state,
         &DatabaseExportRequest {
+            insert_batch_size: None,
             export_id: format!("postgres-all-schema-export-{suffix}"),
             connection_id: source_connection_id,
             database: source_database.clone(),

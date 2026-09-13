@@ -79,12 +79,20 @@ impl SqlInsertMode {
         matches!(self, Self::Single)
     }
 
-    pub(crate) const fn batch_size(self, default: usize) -> usize {
+    /// Rows per INSERT statement for one export request.
+    ///
+    /// `requested` is the user-facing "rows per INSERT" value (DBeaver-style
+    /// "rows in batch"); it falls back to the caller's default when the caller
+    /// did not send one, collapses to a single row when the request asked for
+    /// one statement per row, and is clamped to a range a server can accept.
+    /// Dialect limits (Oracle-style single-row VALUES, SQL Server's 1000-row
+    /// cap) and the per-statement byte cap are applied further down in
+    /// [`build_export_insert_statements`].
+    pub(crate) fn statement_batch_size(self, requested: Option<usize>, default: usize) -> usize {
         if self.flush_each_row() || default == 0 {
-            1
-        } else {
-            default
+            return 1;
         }
+        requested.unwrap_or(default).clamp(1, DATABASE_EXPORT_MAX_INSERT_BATCH_SIZE)
     }
 }
 
@@ -125,7 +133,13 @@ pub struct DatabaseExportRequest {
     pub output_compression: DatabaseExportOutputCompression,
     #[serde(default)]
     pub snapshot_session_id: Option<String>,
+    /// Rows read per round trip while streaming table data.
     pub batch_size: usize,
+    /// Rows per INSERT statement written into the script (1-100000, default
+    /// [`DATABASE_EXPORT_INSERT_BATCH_SIZE`]). Separate from `batch_size`,
+    /// which only controls how many rows are fetched per query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_batch_size: Option<usize>,
     /// When set, the export is packaged as a `.zip` archive containing
     /// multiple `part-N.sql` entries (plus a `manifest.json`), each capped
     /// at this many megabytes, instead of one unbounded `.sql`/`.sql.gz`
@@ -379,6 +393,10 @@ pub const DATABASE_EXPORT_ROW_LIMIT: usize = 10_000;
 pub const DATABASE_EXPORT_PAGE_SIZE: usize = 500;
 pub const DATABASE_EXPORT_INSERT_BATCH_SIZE: usize = 100;
 pub const DATABASE_EXPORT_TARGET_STATEMENT_BYTES: usize = 512 * 1024;
+/// Upper bound for a user-supplied rows-per-INSERT value. Statements are still
+/// cut earlier by `DATABASE_EXPORT_TARGET_STATEMENT_BYTES`, so this only keeps
+/// obviously wrong input from reaching the writers.
+pub const DATABASE_EXPORT_MAX_INSERT_BATCH_SIZE: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PostgresExportSequence {
@@ -2033,6 +2051,7 @@ fn write_database_export_rows<W: Write>(
     table: &str,
     schema: &str,
     db_type: &DatabaseType,
+    insert_batch_size: usize,
 ) -> Result<(), String> {
     let insert_indices = columns
         .iter()
@@ -2094,7 +2113,7 @@ fn write_database_export_rows<W: Write>(
         spatial_columns: Vec::new(),
         spatial_values: Vec::new(),
         rows: insert_rows.to_vec(),
-        batch_size: Some(DATABASE_EXPORT_INSERT_BATCH_SIZE),
+        batch_size: Some(insert_batch_size),
     })?;
     for statement in statements {
         writeln!(file, "{statement}\n").map_err(|error| format!("Failed to write file: {error}"))?;
@@ -3076,6 +3095,11 @@ async fn export_database_sql_core_inner(
     emit_database_export_running(&on_progress, &request.export_id, "", 0, 0, 0, true);
 
     let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
+    // Rows per INSERT statement in the generated script (independent from the
+    // read page size above). The database export always batches; users pick how
+    // many rows each statement carries.
+    let insert_batch_size =
+        SqlInsertMode::Batch.statement_batch_size(request.insert_batch_size, DATABASE_EXPORT_INSERT_BATCH_SIZE);
 
     // 预取各表的 DDL 与列元数据：逐表串行往返在多表数据库上是整库导出耗时的
     // 主要来源（每表 1-2 次网络往返 × 表数）。有界并发预取后，下方写出循环仍按
@@ -3406,6 +3430,7 @@ async fn export_database_sql_core_inner(
                                     table_name,
                                     &request.schema,
                                     &db_type,
+                                    insert_batch_size,
                                 )?;
                                 total_rows_exported += rows.len() as u64;
                                 on_progress(ExportProgress {
@@ -3522,6 +3547,7 @@ async fn export_database_sql_core_inner(
                             table_name,
                             &request.schema,
                             &db_type,
+                            insert_batch_size,
                         )?;
                         total_rows_exported += row_count as u64;
                         if use_keyset {
@@ -3843,11 +3869,27 @@ mod tests {
         sort_export_views_by_dependencies, split_postgres_export_table_triggers, write_database_export_rows,
         BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, DatabaseExportObjectCounts,
         DatabaseExportRequest, DatabaseExportWriter, DdlNormalizeOptions, ExportedTableSql, PostgresExportExtension,
-        PostgresExportSequence, PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
+        PostgresExportSequence, PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE,
+        DATABASE_EXPORT_MAX_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
     use super::{ExportProgress, LenientExportErrors};
     use crate::connection::AppState;
     use crate::models::connection::DatabaseType;
+
+    #[test]
+    fn statement_batch_size_follows_the_request_and_keeps_the_shared_default() {
+        use super::SqlInsertMode;
+
+        assert_eq!(SqlInsertMode::Batch.statement_batch_size(None, DATABASE_EXPORT_INSERT_BATCH_SIZE), 100);
+        assert_eq!(SqlInsertMode::Batch.statement_batch_size(Some(1000), DATABASE_EXPORT_INSERT_BATCH_SIZE), 1000);
+        assert_eq!(SqlInsertMode::Batch.statement_batch_size(Some(0), DATABASE_EXPORT_INSERT_BATCH_SIZE), 1);
+        assert_eq!(
+            SqlInsertMode::Batch.statement_batch_size(Some(usize::MAX), DATABASE_EXPORT_INSERT_BATCH_SIZE),
+            DATABASE_EXPORT_MAX_INSERT_BATCH_SIZE
+        );
+        // One statement per row always wins, whatever the caller asked for.
+        assert_eq!(SqlInsertMode::Single.statement_batch_size(Some(500), DATABASE_EXPORT_INSERT_BATCH_SIZE), 1);
+    }
     use crate::storage::Storage;
     use crate::types::SpatialColumn;
     use crate::types::{ObjectInfo, ObjectSourceKind, TableInfo};
@@ -4045,6 +4087,7 @@ mod tests {
             output_compression: Default::default(),
             snapshot_session_id: None,
             batch_size: 1000,
+            insert_batch_size: None,
             split_max_mb: None,
         }
     }
@@ -5529,6 +5572,7 @@ mod tests {
             "orders",
             "shop",
             &DatabaseType::Mysql,
+            DATABASE_EXPORT_INSERT_BATCH_SIZE,
         )
         .unwrap();
         drop(file);
@@ -5536,6 +5580,34 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
             "INSERT INTO `orders` (`id`, `quantity`, `created_at`) VALUES (7, 2, '2026-07-30 08:00:00');\n\n"
+        );
+    }
+
+    #[test]
+    fn database_export_rows_follow_the_requested_rows_per_insert_statement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orders.sql");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        let rows = (1..=5).map(|id| vec![json!(id)]).collect::<Vec<_>>();
+        write_database_export_rows(
+            &mut file,
+            &rows,
+            &["id".to_string()],
+            &[Some("bigint".to_string())],
+            &[None],
+            "orders",
+            "shop",
+            &DatabaseType::Mysql,
+            3,
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "INSERT INTO `orders` (`id`) VALUES (1), (2), (3);\n\n\
+             INSERT INTO `orders` (`id`) VALUES (4), (5);\n\n"
         );
     }
 
@@ -5565,6 +5637,7 @@ mod tests {
                 "orders",
                 "shop",
                 &DatabaseType::Postgres,
+                DATABASE_EXPORT_INSERT_BATCH_SIZE,
             )
             .unwrap();
         }

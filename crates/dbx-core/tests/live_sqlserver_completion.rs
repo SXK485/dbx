@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connection::ConnectionConfig {
     dbx_core::models::connection::ConnectionConfig {
+        saved_sql_dir: None,
         docs_notes_path: None,
         id: id.to_string(),
         name: id.to_string(),
@@ -1202,6 +1203,7 @@ async fn live_sqlserver_query_result_export_streams_cte_query_to_csv() {
         file_path: file_path.to_string_lossy().to_string(),
         format: "csv".to_string(),
         insert_mode: Default::default(),
+        insert_batch_size: None,
         include_sql_sheet: false,
         page_size: 1,
         row_limit: None,

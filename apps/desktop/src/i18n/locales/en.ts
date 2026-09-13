@@ -1947,6 +1947,8 @@ export default {
     sqlInsertModeBatchDescription: "Combine multiple rows into each INSERT statement for smaller files and faster execution.",
     sqlInsertModeSingle: "One row per statement",
     sqlInsertModeSingleDescription: "Write one complete INSERT statement per row for easier individual execution and troubleshooting.",
+    sqlInsertBatchSize: "Rows per statement",
+    sqlInsertBatchSizeDescription: "How many rows each INSERT statement carries ({min}–{max}); remembered for the next export. Wide tables and large text columns are still split at the per-statement limit.",
     exportTxt: "Export TXT",
     exportSelectedRowsCsv: "Export Selected Rows as CSV",
     exportSelectedRowsXlsx: "Export Selected Rows as XLSX",

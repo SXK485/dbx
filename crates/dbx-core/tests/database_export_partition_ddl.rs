@@ -123,6 +123,7 @@ async fn run_database_export_of_partition_tree_has_no_duplicates_and_replays() {
 
     let file_path = dir.join("export.sql");
     let request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("export-partition-ddl-{}", uuid::Uuid::new_v4()),
         connection_id: connection_id.to_string(),
         database: "postgres".to_string(),

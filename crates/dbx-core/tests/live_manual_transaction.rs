@@ -315,6 +315,7 @@ async fn live_postgres_backup_snapshot_exports_wide_jsonb_then_next_table_inner(
     let snapshot =
         begin_database_backup_snapshot_core(&state, &connection_id, &database).await.expect("begin snapshot");
     let request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("live-postgres-wide-jsonb-{suffix}"),
         connection_id: connection_id.clone(),
         database: database.clone(),
@@ -430,6 +431,7 @@ async fn live_postgres_backup_snapshot_cancel_interrupts_pending_row_inner() {
     clear_export_cancelled(&export_id).await;
     let export_path = std::env::temp_dir().join(format!("dbx-7087-cancel-{suffix}.sql"));
     let request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: export_id.clone(),
         connection_id: role_connection_id,
         database: database.clone(),
@@ -547,6 +549,7 @@ async fn live_mysql_database_backup_refreshes_an_idle_snapshot_before_export() {
     }
 
     let request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("live-mysql-backup-{}", uuid::Uuid::new_v4().simple()),
         connection_id: config.id.clone(),
         database: database.clone(),

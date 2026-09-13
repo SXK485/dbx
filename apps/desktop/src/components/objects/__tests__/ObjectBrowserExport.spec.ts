@@ -32,7 +32,7 @@ describe("ObjectBrowser XLSX export", () => {
 
     expect(exportData).toContain("await showSqlInsertModeDialog({ allowSplit: true })");
     expect(exportData.indexOf("await showSqlInsertModeDialog({ allowSplit: true })")).toBeLessThan(exportData.indexOf("await exportTableData("));
-    expect(exportTableData).toContain('...(format === "sql" ? { insertMode, splitMaxMb } : {})');
+    expect(exportTableData).toContain('...(format === "sql" ? { insertMode, splitMaxMb, insertBatchSize } : {})');
   });
 
   it("falls back to field-name headers when column metadata is unavailable", () => {

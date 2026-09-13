@@ -3055,7 +3055,7 @@ mod tests {
         assert_eq!(scoped_connection_ids(Some(" first, second,first ,, ")), vec!["first", "second"]);
 
         let first = connection("first", "other", "sqlite", ":memory:");
-        let named = ConnectionConfig { id: "named".to_string(), name: "scope-name".to_string(), ..first.clone() };
+        let named = ConnectionConfig { saved_sql_dir: None, id: "named".to_string(), name: "scope-name".to_string(), ..first.clone() };
         let scope = McpScope {
             connection_ids: vec!["first".to_string()],
             connection_name: Some("scope-name".to_string()),
@@ -3335,7 +3335,7 @@ mod tests {
         );
         assert_eq!(normalize_confirmed_write_sql(Some(" \n ".to_string())), None);
 
-        let read_only = ConnectionConfig { read_only: true, ..connection("readonly", "readonly", "postgres", "app") };
+        let read_only = ConnectionConfig { saved_sql_dir: None, read_only: true, ..connection("readonly", "readonly", "postgres", "app") };
         let writable_policy = McpGlobalPolicy {
             read_only: false,
             allow_dangerous_sql: true,

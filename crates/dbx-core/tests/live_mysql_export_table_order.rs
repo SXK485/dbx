@@ -87,6 +87,7 @@ async fn live_mysql_database_export_table_order_is_not_alphabetical_when_fk_reor
 
     let file_path = dir.join("export.sql");
     let export_request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("live-mysql-export-order-{suffix}"),
         connection_id: connection_id.clone(),
         database: database.clone(),

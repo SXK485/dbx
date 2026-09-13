@@ -10014,6 +10014,7 @@ mod tests {
 
     fn jdbc_transfer_config(connection_string: &str, driver_class: &str, profile: &str) -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             id: "test-jdbc".to_string(),
             name: "Test JDBC".to_string(),
             note: String::new(),

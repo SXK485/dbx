@@ -132,6 +132,7 @@ async fn live_mysql_database_export_restores_dependent_views() {
 
     let file_path = dir.join("export.sql");
     let export_request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("live-mysql-export-{suffix}"),
         connection_id: connection_id.clone(),
         database: database.clone(),
@@ -269,6 +270,7 @@ async fn run_live_mysql_database_export_handles_many_tables_including_empty_tabl
         for attempt in 1..=5 {
             let file_path = dir.join(format!("export-{attempt}.sql"));
             let request = DatabaseExportRequest {
+                insert_batch_size: None,
                 export_id: format!("live-mysql-export-many-tables-{suffix}-{attempt}"),
                 connection_id: connection_id.clone(),
                 database: database.clone(),
@@ -364,6 +366,7 @@ async fn live_mysql_database_export_creates_missing_destination_directory() {
     let missing_destination_dir = dir.join("brand-new-local-folder");
     let file_path = missing_destination_dir.join("export.sql");
     let export_request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("live-mysql-export-missing-dir-{suffix}"),
         connection_id: connection_id.clone(),
         database: database.clone(),
@@ -431,6 +434,7 @@ async fn live_mysql_database_export_refuses_to_recreate_a_destination_that_disap
     let destination_dir = dir.join("mounted-drive-destination");
     let file_path = destination_dir.join("export.sql");
     let export_request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("live-mysql-export-vanished-dir-{suffix}"),
         connection_id: connection_id.clone(),
         database: database.clone(),
@@ -519,6 +523,7 @@ async fn live_mysql_database_export_refuses_a_destination_that_vanished_before_i
         .expect("configuring the schedule should succeed");
 
     let export_request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("live-mysql-export-preconfigured-vanished-dir-{suffix}"),
         connection_id: connection_id.clone(),
         database: database.clone(),

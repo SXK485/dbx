@@ -40,11 +40,13 @@ export interface FormatSqlInsertOptions {
   spatialValues?: QueryResult["spatial_values"];
   rows: ExportCellValue[][];
   insertMode?: SqlInsertMode;
+  /** Rows per INSERT statement in batch mode (default 100). */
+  insertBatchSize?: number;
 }
 
-export function formatSqlInsert({ insertMode = "batch", ...options }: FormatSqlInsertOptions): Promise<string> {
+export function formatSqlInsert({ insertMode = "batch", insertBatchSize, ...options }: FormatSqlInsertOptions): Promise<string> {
   return api.buildExportSqlInsert({
     ...options,
-    batchSize: insertMode === "single" ? 1 : undefined,
+    batchSize: insertMode === "single" ? 1 : insertBatchSize,
   });
 }

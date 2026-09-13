@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input";
 import { Download, Square, CheckSquare, Search, X, Loader2, Wrench } from "@lucide/vue";
 import { formatDataTransferDuration, useExportTracker } from "@/composables/useExportTracker";
 import { isQueryTimeoutErrorMessage } from "@/lib/sql/queryError";
+import { MAX_SQL_INSERT_BATCH_SIZE, MIN_SQL_INSERT_BATCH_SIZE, normalizeSqlInsertBatchSize, rememberedSqlInsertBatchSize, rememberSqlInsertBatchSize } from "@/lib/export/sqlInsertBatchSize";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -72,6 +73,9 @@ const splitSqlOutput = ref(false);
 const splitSqlPartMaxMb = ref(100);
 const MIN_SPLIT_SQL_PART_MB = 1;
 const MAX_SPLIT_SQL_PART_MB = 4096;
+// Rows per INSERT statement in the generated script. Starts from the value the
+// user last chose for an INSERT export and is remembered again on export.
+const insertBatchSize = ref(rememberedSqlInsertBatchSize());
 // `AUTO_INCREMENT` stripping is a MySQL-only DDL transform (backend gates on
 // db_type == mysql, which also covers MariaDB / TiDB / OceanBase-MySQL-mode).
 const isMysqlFamily = computed(() => store.getConfig(connectionId.value)?.db_type === "mysql");
@@ -169,6 +173,10 @@ function normalizedSplitSqlPartMaxMb(): number {
   const value = Number(splitSqlPartMaxMb.value);
   if (!Number.isFinite(value)) return 100;
   return Math.min(MAX_SPLIT_SQL_PART_MB, Math.max(MIN_SPLIT_SQL_PART_MB, Math.round(value)));
+}
+
+function normalizedInsertBatchSize(): number {
+  return normalizeSqlInsertBatchSize(insertBatchSize.value);
 }
 
 // Lenient exports write per-object failures into the SQL file as `-- ERROR`
@@ -402,8 +410,10 @@ async function startExport() {
           omitAutoIncrement: omitAutoIncrement.value,
           snapshotSessionId,
           batchSize: 1000,
+          insertBatchSize: normalizedInsertBatchSize(),
           splitMaxMb: splitSqlOutput.value ? normalizedSplitSqlPartMaxMb() : undefined,
         };
+        rememberSqlInsertBatchSize(insertBatchSize.value);
         return runDatabaseExportUntilTerminal(request, (progress) => {
           exportProgress.value = { ...progress };
           updateDatabaseExportTask(progress.exportId, progress);
@@ -544,6 +554,7 @@ async function startAllDatabasesExport() {
               omitAutoIncrement: omitAutoIncrement.value,
               snapshotSessionId,
               batchSize: 1000,
+              insertBatchSize: normalizedInsertBatchSize(),
               splitMaxMb: splitSqlOutput.value ? normalizedSplitSqlPartMaxMb() : undefined,
             },
             (progress) => {
@@ -946,6 +957,10 @@ watch(
               <CheckSquare v-if="includeData" class="w-3.5 h-3.5 text-primary shrink-0" />
               <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
               {{ t("databaseExport.includeData") }}
+            </div>
+            <div v-if="includeData" class="flex items-center justify-between gap-2 pl-5.5 text-xs">
+              <span class="min-w-0 text-muted-foreground">{{ t("grid.sqlInsertBatchSize") }}</span>
+              <Input v-model.number="insertBatchSize" type="number" inputmode="numeric" :min="MIN_SQL_INSERT_BATCH_SIZE" :max="MAX_SQL_INSERT_BATCH_SIZE" class="h-7 w-24 text-xs" :aria-label="t('grid.sqlInsertBatchSize')" @blur="insertBatchSize = normalizedInsertBatchSize()" />
             </div>
             <div class="flex items-center gap-2 cursor-pointer text-xs" @click="includeObjects = !includeObjects">
               <CheckSquare v-if="includeObjects" class="w-3.5 h-3.5 text-primary shrink-0" />

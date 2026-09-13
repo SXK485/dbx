@@ -68,7 +68,42 @@ describe("SqlInsertModeDialog", () => {
     document.querySelector<HTMLButtonElement>("[data-sql-insert-mode-confirm]")?.click();
 
     expect(onConfirm).toHaveBeenCalledOnce();
-    expect(onConfirm).toHaveBeenCalledWith({ insertMode: "single", splitMaxMb: undefined });
+    expect(onConfirm).toHaveBeenCalledWith({ insertMode: "single", splitMaxMb: undefined, insertBatchSize: undefined });
+  });
+
+  it("lets the batch mode choose how many rows each INSERT carries", async () => {
+    const onConfirm = vi.fn();
+    await mountDialog(onConfirm);
+
+    const rows = document.querySelector<HTMLInputElement>("input[data-sql-insert-batch-size]");
+    expect(rows?.value).toBe("100");
+    if (rows) rows.value = "1000";
+    rows?.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector<HTMLButtonElement>("[data-sql-insert-mode-confirm]")?.click();
+
+    expect(onConfirm).toHaveBeenCalledWith({ insertMode: "batch", splitMaxMb: undefined, insertBatchSize: 1000 });
+  });
+
+  it("clamps an out-of-range rows-per-statement value", async () => {
+    const onConfirm = vi.fn();
+    await mountDialog(onConfirm);
+
+    const rows = document.querySelector<HTMLInputElement>("input[data-sql-insert-batch-size]");
+    if (rows) rows.value = "0";
+    rows?.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector<HTMLButtonElement>("[data-sql-insert-mode-confirm]")?.click();
+
+    expect(onConfirm).toHaveBeenCalledWith({ insertMode: "batch", splitMaxMb: undefined, insertBatchSize: 1 });
+  });
+
+  it("hides the rows-per-statement control for the single-row mode", async () => {
+    await mountDialog();
+
+    expect(document.querySelector("input[data-sql-insert-batch-size]")).not.toBeNull();
+    document.querySelector<HTMLInputElement>('input[data-sql-insert-mode="single"]')?.click();
+    await nextTick();
+
+    expect(document.querySelector("input[data-sql-insert-batch-size]")).toBeNull();
   });
 
   it("enables split ZIP output only when the caller supports it", async () => {
@@ -85,7 +120,7 @@ describe("SqlInsertModeDialog", () => {
     size?.dispatchEvent(new Event("input", { bubbles: true }));
     document.querySelector<HTMLButtonElement>("[data-sql-insert-mode-confirm]")?.click();
 
-    expect(onConfirm).toHaveBeenCalledWith({ insertMode: "batch", splitMaxMb: 256 });
+    expect(onConfirm).toHaveBeenCalledWith({ insertMode: "batch", splitMaxMb: 256, insertBatchSize: 100 });
   });
 
   it("renders the batch and single-row explanations", async () => {

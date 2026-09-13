@@ -518,6 +518,7 @@ interface DataGridProps {
     exportTableName?: string;
     exportColumnTypes?: Array<string | null | undefined>;
     insertMode?: SqlInsertMode;
+    insertBatchSize?: number;
   }) => Promise<api.QueryResultExportRequest | undefined>;
   allExportResults?: Array<{
     sheetName: string;

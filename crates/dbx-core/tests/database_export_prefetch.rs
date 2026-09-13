@@ -62,6 +62,7 @@ async fn run_database_export_writes_structure_and_data_for_all_tables() {
 
     let file_path = dir.join("export.sql");
     let request = DatabaseExportRequest {
+        insert_batch_size: None,
         export_id: format!("export-prefetch-{}", uuid::Uuid::new_v4()),
         connection_id: connection_id.to_string(),
         database: "postgres".to_string(),

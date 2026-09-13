@@ -38,6 +38,14 @@ use crate::xlsx_export::{finish_streaming_xlsx_workbook, start_streaming_xlsx_wo
 const DEFAULT_BATCH_SIZE: usize = 10_000;
 const SQL_INSERT_BATCH_SIZE: usize = 100;
 
+impl TableExportRequest {
+    /// Rows per INSERT statement for SQL exports: the request's value when the
+    /// caller sent one, otherwise the historical 100-row default.
+    fn sql_insert_batch_size(&self) -> usize {
+        self.insert_mode.statement_batch_size(self.insert_batch_size, SQL_INSERT_BATCH_SIZE)
+    }
+}
+
 pub fn table_export_client_session_id(export_id: &str) -> String {
     task_client_session_id("table-export", export_id)
 }
@@ -57,6 +65,11 @@ pub struct TableExportRequest {
     pub format: String,
     #[serde(default)]
     pub insert_mode: SqlInsertMode,
+    /// SQL format only: rows per INSERT statement (1-100000). Oracle-compatible
+    /// dialects always write one row per statement, SQL Server is capped at
+    /// 1000 rows, and a statement never grows past the shared byte cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_batch_size: Option<usize>,
     #[serde(default)]
     pub csv_quote_mode: CsvQuoteMode,
     #[serde(default)]
@@ -1327,7 +1340,7 @@ async fn try_export_native_table_stream(
                         spatial_columns: Vec::new(),
                         spatial_values: Vec::new(),
                         rows: std::mem::take(pending_rows),
-                        batch_size: Some(request.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
+                        batch_size: Some(request.sql_insert_batch_size()),
                     })?;
                     if !statements.is_empty() {
                         if wrote_statements {
@@ -1349,7 +1362,7 @@ async fn try_export_native_table_stream(
                 cancel_token.clone(),
                 |row| {
                     pending_rows.push(row.to_vec());
-                    if request.insert_mode.flush_each_row() || pending_rows.len() >= SQL_INSERT_BATCH_SIZE {
+                    if request.insert_mode.flush_each_row() || pending_rows.len() >= request.sql_insert_batch_size() {
                         flush_pending(&mut file, &mut pending_rows)?;
                     }
                     rows_exported += 1;
@@ -2166,7 +2179,7 @@ async fn export_table_data_core_inner(
                     spatial_columns: result.spatial_columns.clone(),
                     spatial_values: result.spatial_values.clone(),
                     rows: result.rows.clone(),
-                    batch_size: Some(request.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
+                    batch_size: Some(request.sql_insert_batch_size()),
                 })?;
                 if !statements.is_empty() {
                     if wrote_statements {
@@ -2255,6 +2268,38 @@ mod tests {
         .expect("deserialize table export request");
 
         assert_eq!(request.insert_mode, SqlInsertMode::Batch);
+    }
+
+    #[test]
+    fn table_export_request_rows_per_insert_statement() {
+        fn request(insert_mode: SqlInsertMode, insert_batch_size: Option<usize>) -> TableExportRequest {
+            let mut request: TableExportRequest = serde_json::from_value(json!({
+                "exportId": "export-1",
+                "connectionId": "conn-1",
+                "database": "db",
+                "schema": null,
+                "tableName": "users",
+                "filePath": "users.sql",
+                "format": "sql",
+                "insertMode": insert_mode,
+                "insertBatchSize": insert_batch_size,
+            }))
+            .expect("deserialize table export request");
+            request.insert_batch_size = insert_batch_size;
+            request
+        }
+
+        // No value from the caller keeps the historical 100 rows per statement.
+        assert_eq!(request(SqlInsertMode::Batch, None).sql_insert_batch_size(), 100);
+        // A DBeaver-style choice is honoured, bounded by the shared range.
+        assert_eq!(request(SqlInsertMode::Batch, Some(1000)).sql_insert_batch_size(), 1000);
+        assert_eq!(request(SqlInsertMode::Batch, Some(0)).sql_insert_batch_size(), 1);
+        assert_eq!(
+            request(SqlInsertMode::Batch, Some(usize::MAX)).sql_insert_batch_size(),
+            crate::database_export::DATABASE_EXPORT_MAX_INSERT_BATCH_SIZE
+        );
+        // Single-row mode always wins over the requested batch size.
+        assert_eq!(request(SqlInsertMode::Single, Some(1000)).sql_insert_batch_size(), 1);
     }
 
     #[cfg(unix)]
@@ -2350,6 +2395,7 @@ mod tests {
             file_path: output.to_string_lossy().into_owned(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: Some(vec!["id".to_string(), "name".to_string()]),
             column_types: Some(vec![Some("INTEGER".to_string()), Some("VARCHAR".to_string())]),
             primary_keys: Some(vec!["id".to_string()]),
@@ -2513,6 +2559,7 @@ mod tests {
             file_path: output.to_string_lossy().into_owned(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             csv_quote_mode: CsvQuoteMode::All,
             columns: None,
             column_types: None,
@@ -2679,6 +2726,7 @@ mod tests {
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2738,6 +2786,7 @@ mod tests {
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2775,6 +2824,7 @@ mod tests {
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2807,6 +2857,7 @@ mod tests {
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2847,6 +2898,7 @@ mod tests {
             file_path: "samples.csv".to_string(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2899,6 +2951,7 @@ mod tests {
             file_path: "events.csv".to_string(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2945,6 +2998,7 @@ mod tests {
             file_path: "orders.txt".to_string(),
             format: "txt".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -3019,6 +3073,7 @@ mod tests {
             file_path: "order.csv".to_string(),
             format: "csv".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -3075,6 +3130,7 @@ mod tests {
             file_path: "spatial_data.sql".to_string(),
             format: "sql".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -3133,6 +3189,7 @@ mod tests {
             file_path: "users.sql".to_string(),
             format: "sql".to_string(),
             insert_mode: Default::default(),
+            insert_batch_size: None,
             columns: None,
             column_types: None,
             primary_keys: None,

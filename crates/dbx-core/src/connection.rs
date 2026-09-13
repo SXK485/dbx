@@ -6836,6 +6836,7 @@ mod tests {
         let err = r#"MongoDB connection failed: Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: db.example.com:27017, Type: Unknown, Error: Kind: I/O error: unexpected end of file } ] }"#;
 
         assert!(mongo_uses_legacy_driver(&ConnectionConfig {
+            saved_sql_dir: None,
             driver_profile: Some("mongodb-legacy".to_string()),
             ..mysql_config(None)
         }));

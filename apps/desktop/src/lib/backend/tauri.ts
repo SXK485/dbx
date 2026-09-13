@@ -5283,6 +5283,8 @@ export interface DatabaseExportRequest {
   outputCompression?: "none" | "gzip";
   snapshotSessionId?: string;
   batchSize: number;
+  /** Rows per INSERT statement written into the script (default 100). */
+  insertBatchSize?: number;
   splitMaxMb?: number;
 }
 
@@ -5321,6 +5323,8 @@ export interface TableExportRequest {
   filePath: string;
   format: "csv" | "xlsx" | "json" | "markdown" | "sql" | "txt";
   insertMode?: SqlInsertMode;
+  /** SQL format only: rows per INSERT statement (default 100). */
+  insertBatchSize?: number;
   csvQuoteMode?: CsvQuoteMode;
   columns?: string[];
   columnTypes?: Array<string | null | undefined>;
@@ -5372,6 +5376,8 @@ export interface QueryResultExportRequest {
   filePath: string;
   format: "csv" | "xlsx" | "txt" | "sql";
   insertMode?: SqlInsertMode;
+  /** SQL format only: rows per INSERT statement (default 100). */
+  insertBatchSize?: number;
   csvQuoteMode?: CsvQuoteMode;
   includeSqlSheet?: boolean;
   pageSize: number;

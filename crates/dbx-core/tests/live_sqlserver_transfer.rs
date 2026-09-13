@@ -11,6 +11,7 @@ use std::time::Duration;
 
 fn live_sqlserver_config(id: &str, database: &str) -> ConnectionConfig {
     ConnectionConfig {
+        saved_sql_dir: None,
         docs_notes_path: None,
         id: id.to_string(),
         name: id.to_string(),

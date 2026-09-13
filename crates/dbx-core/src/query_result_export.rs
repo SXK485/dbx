@@ -85,6 +85,10 @@ pub struct QueryResultExportRequest {
     pub format: String,
     #[serde(default)]
     pub insert_mode: SqlInsertMode,
+    /// SQL format only: rows per INSERT statement (1-100000). Falls back to the
+    /// historical 100-row default when the caller sends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_batch_size: Option<usize>,
     #[serde(default)]
     pub csv_quote_mode: CsvQuoteMode,
     #[serde(default)]
@@ -304,9 +308,9 @@ fn sql_insert_column_types(request: &QueryResultExportRequest, column_types: &[S
 
 /// Bounded SQL INSERT writer with staged-file replacement safety.
 ///
-/// Batch mode buffers rows up to [`SQL_INSERT_BATCH_SIZE`], while single mode
-/// flushes each row immediately. Both modes keep memory bounded regardless of
-/// the query page size. The unique
+/// Batch mode buffers rows up to the requested rows-per-INSERT value (100 by
+/// default), while single mode flushes each row immediately. Both modes keep
+/// memory bounded regardless of the query page size. The unique
 /// temp file lives alongside the target and replaces it only after
 /// [`SqlInsertWriter::finish`] flushes and synchronizes the complete output.
 struct SqlInsertWriter {
@@ -315,6 +319,7 @@ struct SqlInsertWriter {
     pending_rows: Vec<Vec<Value>>,
     pending_spatial_values: Vec<Vec<Option<u32>>>,
     insert_mode: SqlInsertMode,
+    insert_batch_size: usize,
     columns: Vec<String>,
     column_types: Vec<Option<String>>,
     spatial_columns: Vec<SpatialColumn>,
@@ -344,6 +349,9 @@ impl SqlInsertWriter {
             pending_rows: Vec::new(),
             pending_spatial_values: Vec::new(),
             insert_mode: request.insert_mode,
+            insert_batch_size: request
+                .insert_mode
+                .statement_batch_size(request.insert_batch_size, SQL_INSERT_BATCH_SIZE),
             columns: Vec::new(),
             column_types: Vec::new(),
             spatial_columns: Vec::new(),
@@ -372,7 +380,7 @@ impl SqlInsertWriter {
     fn write_row(&mut self, row: Vec<Value>, spatial_values: Option<Vec<Option<u32>>>) -> Result<(), String> {
         self.pending_rows.push(row);
         self.pending_spatial_values.push(spatial_values.unwrap_or_default());
-        if self.insert_mode.flush_each_row() || self.pending_rows.len() >= SQL_INSERT_BATCH_SIZE {
+        if self.insert_mode.flush_each_row() || self.pending_rows.len() >= self.insert_batch_size {
             self.flush_batch()?;
         }
         Ok(())
@@ -394,7 +402,7 @@ impl SqlInsertWriter {
             spatial_columns: self.spatial_columns.clone(),
             spatial_values: mem::take(&mut self.pending_spatial_values),
             rows: mem::take(&mut self.pending_rows),
-            batch_size: Some(self.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
+            batch_size: Some(self.insert_batch_size),
         })?;
         let file = self.file.as_mut().ok_or_else(|| "SQL export file already closed".to_string())?;
         for stmt in &stmts {
@@ -1973,6 +1981,7 @@ mod tests {
             file_path: "out.csv".to_string(),
             format: format.to_string(),
             insert_mode: SqlInsertMode::default(),
+            insert_batch_size: None,
             include_sql_sheet: false,
             page_size: 1000,
             row_limit,

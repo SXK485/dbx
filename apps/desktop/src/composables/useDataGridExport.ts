@@ -121,6 +121,7 @@ export interface UseDataGridExportOptions {
     exportTableName?: string;
     exportColumnTypes?: Array<string | null | undefined>;
     insertMode?: SqlInsertMode;
+    insertBatchSize?: number;
   }) => Promise<QueryResultExportRequest | undefined>;
   /**
    * True when the in-memory result already holds the complete result set —
@@ -1224,7 +1225,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
           tableName: meta.tableName,
           filePath: outputPath,
           format,
-          ...(format === "sql" && sqlExportOptions ? { insertMode: sqlExportOptions.insertMode, splitMaxMb: sqlExportOptions.splitMaxMb } : {}),
+          ...(format === "sql" && sqlExportOptions ? { insertMode: sqlExportOptions.insertMode, splitMaxMb: sqlExportOptions.splitMaxMb, insertBatchSize: sqlExportOptions.insertBatchSize } : {}),
           csvQuoteMode: editorSettings.csvQuoteMode,
           columns: columns.value,
           columnTypes: columnTypes.value,
@@ -1265,7 +1266,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     return true;
   }
 
-  async function exportQueryResultViaBackend(format: "csv" | "xlsx" | "txt" | "sql", rowIds?: number[], includeSqlSheet = false, headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode?: SqlInsertMode): Promise<boolean> {
+  async function exportQueryResultViaBackend(format: "csv" | "xlsx" | "txt" | "sql", rowIds?: number[], includeSqlSheet = false, headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode?: SqlInsertMode, insertBatchSize?: number): Promise<boolean> {
     if (rowIds !== undefined || context.value !== "results" || !queryResultExportRequest) {
       return false;
     }
@@ -1296,7 +1297,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       includeSqlSheet,
       exportTableName: format === "sql" ? tableMeta.value?.tableName : undefined,
       exportColumnTypes: format === "sql" ? allColumnTypes.value?.map((type) => type ?? null) : undefined,
-      ...(format === "sql" && insertMode ? { insertMode } : {}),
+      ...(format === "sql" && insertMode ? { insertMode, insertBatchSize } : {}),
     });
     const columnComments = format === "xlsx" ? buildXlsxHeaderOverrides(allColumns.value, allXlsxColumnComments.value, headerMode) : undefined;
     const request = baseRequest
@@ -1379,9 +1380,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     return true;
   }
 
-  async function exportQueryResultSqlViaBackend(rowIds: number[] | undefined, insertMode: SqlInsertMode): Promise<boolean> {
+  async function exportQueryResultSqlViaBackend(rowIds: number[] | undefined, insertMode: SqlInsertMode, insertBatchSize?: number): Promise<boolean> {
     if (!isTauriRuntime()) return false;
-    return exportQueryResultViaBackend("sql", rowIds, false, "name", true, insertMode);
+    return exportQueryResultViaBackend("sql", rowIds, false, "name", true, insertMode, insertBatchSize);
   }
 
   async function exportSql(rowIds?: number[]) {
@@ -1417,7 +1418,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       }
       const sqlExportOptions = typeof selectedSqlExportOptions === "string" ? { insertMode: selectedSqlExportOptions } : selectedSqlExportOptions;
       const insertMode = sqlExportOptions.insertMode;
-      logExportStage("mode-selected", { insertMode, splitMaxMb: sqlExportOptions.splitMaxMb });
+      logExportStage("mode-selected", { insertMode, splitMaxMb: sqlExportOptions.splitMaxMb, insertBatchSize: sqlExportOptions.insertBatchSize });
       try {
         // Step 1: table-data context — existing backend table export
         logExportStage("backend-export-start");
@@ -1430,7 +1431,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
 
         // Step 2: query-result context — NEW backend streaming with background task
         logExportStage("query-backend-export-start");
-        const handledQueryByBackend = await exportQueryResultSqlViaBackend(rowIds, insertMode);
+        const handledQueryByBackend = await exportQueryResultSqlViaBackend(rowIds, insertMode, sqlExportOptions.insertBatchSize);
         logExportStage("query-backend-export-finished", { handledByBackend: handledQueryByBackend });
         if (handledQueryByBackend) {
           logExportStage("done", { path: "query-backend" });
@@ -1469,6 +1470,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
           spatialValues: exportData.spatialValues,
           rows: exportData.rows,
           insertMode,
+          insertBatchSize: sqlExportOptions.insertBatchSize,
         });
         logExportStage(
           "sql-build-done",
@@ -1496,6 +1498,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       const selectedSqlExportOptions = (await showSqlInsertModeDialog()) as SqlExportOptions | SqlInsertMode | null;
       if (selectedSqlExportOptions === null) return;
       const insertMode = typeof selectedSqlExportOptions === "string" ? selectedSqlExportOptions : selectedSqlExportOptions.insertMode;
+      const insertBatchSize = typeof selectedSqlExportOptions === "string" ? undefined : selectedSqlExportOptions.insertBatchSize;
       try {
         const result = await resultToExport(undefined, undefined, false, false);
         const exportData = sqlInsertExportData(result);
@@ -1510,6 +1513,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
           spatialValues: exportData.spatialValues,
           rows: exportData.rows,
           insertMode,
+          insertBatchSize,
         });
         await saveTextFile(content, exportFileName("export-page", "sql", { page: true }), "SQL", "sql");
         toast(t("grid.exported"));

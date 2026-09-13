@@ -20,6 +20,7 @@ import XlsxHeaderDialog from "@/components/export/XlsxHeaderDialog.vue";
 import { buildXlsxHeaderOverrides, hasXlsxHeaderComments, type XlsxExportOptions, type XlsxHeaderMode } from "@/lib/export/xlsxHeader";
 import { isLoadingStructurePreview, showStructureDocCopyDialog, showStructurePreviewDialog, structureDocCopyText, structureDocCopyTitle, structurePreviewDefaultFileName, structurePreviewError, structurePreviewSql, structurePreviewTitle } from "@/components/sidebar/sidebarTreeDialogState";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
+import { showSqlInsertModeDialog, type SqlInsertMode } from "@/lib/export/sqlInsertMode";
 
 type StructureCopyFormat = "tsv" | "markdown";
 
@@ -78,6 +79,9 @@ interface ExportTableDataOptions {
   autoFilter?: boolean;
   outputDirectory?: string;
   suppressDoneToast?: boolean;
+  /** SQL exports only: how rows are written into the INSERT file. */
+  insertMode?: SqlInsertMode;
+  insertBatchSize?: number;
 }
 
 function joinExportFilePath(directory: string, fileName: string): string {
@@ -387,7 +391,7 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
   }
 
   async function exportTableData(target: SidebarTableExportTarget, format: "csv" | "xlsx" | "sql", exportOptions: ExportTableDataOptions = {}) {
-    const { columnInfos, headerMode = "name", autoFilter = true, outputDirectory, suppressDoneToast = false } = exportOptions;
+    const { columnInfos, headerMode = "name", autoFilter = true, outputDirectory, suppressDoneToast = false, insertMode, insertBatchSize } = exportOptions;
     const { connectionId, database } = target;
 
     let task: ExportTask | null = null;
@@ -444,6 +448,7 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
         columnComments,
         autoFilter: format === "xlsx" ? autoFilter : undefined,
         primaryKeys,
+        ...(format === "sql" ? { insertMode: insertMode ?? "batch", insertBatchSize } : {}),
         batchSize: target.batchSize,
         skipCount: format === "sql",
         rowLimit: target.rowLimit,
@@ -519,6 +524,16 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
     const targets = currentTableExportTargets();
     if (!targets.length) return;
 
+    // SQL exports ask the same question as the object browser and the data grid
+    // (batch vs one row per statement, plus how many rows each statement
+    // carries) instead of silently writing the default 100-row batches.
+    let sqlExportOptions: { insertMode: SqlInsertMode; insertBatchSize?: number } | undefined;
+    if (format === "sql") {
+      const selected = await showSqlInsertModeDialog();
+      if (selected === null) return;
+      sqlExportOptions = selected;
+    }
+
     const outputDirectory = await resolveMultiTableExportDirectory(targets.length);
     if (outputDirectory === null) return;
 
@@ -533,7 +548,7 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
 
     let exported = 0;
     for (const target of targets) {
-      if (await exportTableData(target, format, { outputDirectory, suppressDoneToast: targets.length > 1 })) exported += 1;
+      if (await exportTableData(target, format, { outputDirectory, suppressDoneToast: targets.length > 1, insertMode: sqlExportOptions?.insertMode, insertBatchSize: sqlExportOptions?.insertBatchSize })) exported += 1;
     }
     if (targets.length > 1 && exported > 0) toast(t("contextMenu.exportDataMultipleSuccess", { count: exported }));
   }

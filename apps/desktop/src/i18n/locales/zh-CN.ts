@@ -1862,6 +1862,8 @@ export default withEnglishFallback({
     sqlInsertModeBatchDescription: "将多行数据合并到一条 INSERT 语句，文件更小且执行效率更高。",
     sqlInsertModeSingle: "每行独立",
     sqlInsertModeSingleDescription: "每行生成一条完整的 INSERT 语句，便于单独执行和排查。",
+    sqlInsertBatchSize: "每批行数",
+    sqlInsertBatchSizeDescription: "每条 INSERT 语句写入多少行（{min}–{max}），下次导出自动沿用；超宽表或大文本字段仍会按单条语句上限提前切分。",
     exportTxt: "导出 TXT",
     exportSelectedRowsCsv: "导出选中行为 CSV",
     exportSelectedRowsXlsx: "导出选中行为 XLSX",

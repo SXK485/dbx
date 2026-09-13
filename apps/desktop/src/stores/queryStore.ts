@@ -159,6 +159,8 @@ interface BuildQueryResultExportRequestOptions {
   exportTableName?: string;
   exportColumnTypes?: Array<string | null | undefined>;
   insertMode?: SqlInsertMode;
+  /** SQL exports only: rows per INSERT statement (default 100). */
+  insertBatchSize?: number;
 }
 
 interface OpenSavedSqlOptions {
@@ -8003,7 +8005,7 @@ export const useQueryStore = defineStore("query", () => {
       useAgentCursor,
       filePath: options.filePath,
       format: options.format,
-      ...(options.format === "sql" && options.insertMode ? { insertMode: options.insertMode } : {}),
+      ...(options.format === "sql" && options.insertMode ? { insertMode: options.insertMode, insertBatchSize: options.insertBatchSize } : {}),
       includeSqlSheet: options.format === "xlsx" && options.includeSqlSheet === true,
       pageSize: settings.exportBatchSize,
       rowLimit,
