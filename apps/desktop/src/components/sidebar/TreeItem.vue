@@ -833,13 +833,14 @@ function isPinnedNode(): boolean {
   return activeNode.value.pinned || connectionStore.isTreeNodePinned(activeNode.value);
 }
 
-const isNodeDefaultDatabase = computed(
-  () =>
+function isNodeDefaultDatabase(): boolean {
+  return (
     (activeNode.value.type === "database" || activeNode.value.type === "redis-db" || activeNode.value.type === "mongo-db") &&
     !!activeNode.value.connectionId &&
     typeof activeNode.value.database === "string" &&
-    connectionStore.isDefaultDatabase(activeNode.value.connectionId, activeNode.value.database),
-);
+    connectionStore.isDefaultDatabase(activeNode.value.connectionId, activeNode.value.database)
+  );
+}
 function isNodeDefaultSchema(): boolean {
   return activeNode.value.type === "schema" && !!activeNode.value.connectionId && !!activeNode.value.schema && connectionStore.isDefaultSchema(activeNode.value.connectionId, activeNode.value.schema);
 }
@@ -1150,7 +1151,7 @@ function pinnedSortKey(): string {
 }
 
 function canDragPinnedOrder(): boolean {
-  return isPinnedNode() && !isNodeDefaultDatabase.value && !props.reorderDisabled;
+  return isPinnedNode() && !isNodeDefaultDatabase() && !props.reorderDisabled;
 }
 
 const {
@@ -1653,7 +1654,7 @@ function onKeydown(event: KeyboardEvent) {
               class="text-muted-foreground text-[10px] shrink-0"
               >{{ node.objectCount }}<span v-if="hasActiveObjectNameFilter(node)"> · {{ t("tree.tableNameFilterActive") }}</span></span
             >
-            <Badge v-if="isNodeDefaultDatabase" variant="secondary" class="h-4 px-1.5 text-[10px]">
+            <Badge v-if="isNodeDefaultDatabase()" variant="secondary" class="h-4 px-1.5 text-[10px]">
               {{ t("editor.defaultDatabase") }}
             </Badge>
             <Badge v-if="isNodeDefaultSchema()" variant="secondary" class="h-4 px-1.5 text-[10px]">
