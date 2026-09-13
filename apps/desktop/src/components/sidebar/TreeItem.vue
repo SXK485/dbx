@@ -829,7 +829,9 @@ const canExpand = computed(() => {
   });
 });
 
-const isPinned = computed(() => activeNode.value.pinned || connectionStore.isTreeNodePinned(activeNode.value));
+function isPinnedNode(): boolean {
+  return activeNode.value.pinned || connectionStore.isTreeNodePinned(activeNode.value);
+}
 
 const isNodeDefaultDatabase = computed(
   () =>
@@ -933,7 +935,7 @@ const labelWidthClass = computed(() => {
   // inline/right 模式 leading 块无固定宽度，label 用 shrink 让 comment 紧跟 label，
   // 避免 label flex-1 把 leading 块撑到整行、comment 被推到视口最右端。
   const alignLeading = alignedCommentLabelWidth.value !== undefined;
-  return treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinned.value, alignLeading });
+  return treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinnedNode(), alignLeading });
 });
 
 watch(() => [isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
@@ -1148,7 +1150,7 @@ function pinnedSortKey(): string {
 }
 
 function canDragPinnedOrder(): boolean {
-  return isPinned.value && !isNodeDefaultDatabase.value && !props.reorderDisabled;
+  return isPinnedNode() && !isNodeDefaultDatabase.value && !props.reorderDisabled;
 }
 
 const {
@@ -1620,7 +1622,7 @@ function onKeydown(event: KeyboardEvent) {
             >
               <Pin class="h-3 w-3 fill-current" aria-hidden="true" />
             </button>
-            <Pin v-else-if="isPinned" class="h-3 w-3 shrink-0 fill-current text-primary" aria-hidden="true" />
+            <Pin v-else-if="isPinnedNode()" class="h-3 w-3 shrink-0 fill-current text-primary" aria-hidden="true" />
             <ProductionContextBadge v-if="showProductionBadge" compact />
             <span
               v-if="
