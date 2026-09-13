@@ -710,7 +710,7 @@ test("copies saved SQL into the target database with a Navicat-style suffix", as
     createdAt: "2026-06-27T00:00:00.000Z",
     updatedAt: "2026-06-27T00:00:00.000Z",
   };
-  const firstCopy: SavedSqlFile = { ...source, id: "sql-2", name: "report_copy1.sql" };
+  const firstCopy: SavedSqlFile = { ...source, id: "sql-2", name: "report - 副本.sql" };
   apiMock.loadSavedSqlLibrary.mockResolvedValue({ folders: [folder], files: [source, firstCopy] });
 
   const store = useSavedSqlStore();
@@ -722,7 +722,7 @@ test("copies saved SQL into the target database with a Navicat-style suffix", as
   });
 
   assert.equal(copies.length, 1);
-  assert.equal(copies[0]?.name, "report_copy2.sql");
+  assert.equal(copies[0]?.name, "report - 副本 (2).sql");
   assert.equal(copies[0]?.connectionId, "conn-1");
   assert.equal(copies[0]?.database, "app");
   assert.equal(copies[0]?.schema, "public");
@@ -753,7 +753,7 @@ test("hydrates saved SQL before copying it to another database", async () => {
     schema: "reporting",
   });
 
-  assert.equal(copy?.name, "report_copy1.sql");
+  assert.equal(copy?.name, "report - 副本.sql");
   assert.equal(copy?.connectionId, "conn-2");
   assert.equal(copy?.database, "analytics");
   assert.equal(copy?.schema, "reporting");
@@ -778,7 +778,7 @@ test("concurrent saved SQL pastes reserve different copy names in the same folde
   await store.initFromStorage();
   const [first, second] = await Promise.all([store.copyFilesToDatabase([source.id], { connectionId: "conn-1", catalog: "hive", database: "analytics" }), store.copyFilesToDatabase([source.id], { connectionId: "conn-1", catalog: "hive", database: "other" })]);
 
-  assert.deepEqual([first[0]?.name, second[0]?.name].sort(), ["report_copy1.sql", "report_copy2.sql"]);
+  assert.deepEqual([first[0]?.name, second[0]?.name].sort(), ["report - 副本 (2).sql", "report - 副本.sql"]);
   assert.equal(first[0]?.catalog, "hive");
   assert.equal(second[0]?.catalog, "hive");
 });
@@ -819,7 +819,7 @@ test("saved SQL paste skips a copy name reserved by a concurrent rename", async 
   const store = useSavedSqlStore();
   await store.initFromStorage();
 
-  const rename = store.renameFile("sql-rename", "report_copy1.sql");
+  const rename = store.renameFile("sql-rename", "report - 副本.sql");
   await vi.waitFor(() => assert.equal(apiMock.saveSavedSqlFile.mock.calls.length, 1));
   const [copy] = await store.copyFilesToDatabase(["sql-source"], {
     connectionId: "conn-1",
@@ -828,8 +828,8 @@ test("saved SQL paste skips a copy name reserved by a concurrent rename", async 
   finishRename?.();
   await rename;
 
-  assert.equal(copy?.name, "report_copy2.sql");
-  assert.equal(store.getFile("sql-rename")?.name, "report_copy1.sql");
+  assert.equal(copy?.name, "report - 副本 (2).sql");
+  assert.equal(store.getFile("sql-rename")?.name, "report - 副本.sql");
 });
 
 test("failed saved SQL paste releases its reserved copy name for retry", async () => {
@@ -853,7 +853,7 @@ test("failed saved SQL paste releases its reserved copy name for retry", async (
   await assert.rejects(store.copyFilesToDatabase([source.id], target), /disk full/);
   const [retry] = await store.copyFilesToDatabase([source.id], target);
 
-  assert.equal(retry?.name, "report_copy1.sql");
+  assert.equal(retry?.name, "report - 副本.sql");
 });
 
 test("usage updates do not invalidate the saved SQL database tree", async () => {
@@ -1024,13 +1024,13 @@ test("SQL copy names ignore files in other folders of the same database", async 
     sql: "SELECT 1;",
     sqlLoaded: true,
   };
-  const other = { ...source, id: "other", folderId: "folder-2", name: "report_copy1.sql" };
+  const other = { ...source, id: "other", folderId: "folder-2", name: "report - 副本.sql" };
   apiMock.loadSavedSqlLibrary.mockResolvedValue({ folders: [folder], files: [source, other] });
   const store = useSavedSqlStore();
   await store.initFromStorage();
 
   const [copy] = await store.copyFilesToDatabase([source.id], { connectionId: "conn-1", database: "analytics" });
 
-  assert.equal(copy?.name, "report_copy1.sql");
+  assert.equal(copy?.name, "report - 副本.sql");
   assert.equal(copy?.folderId, "folder-1");
 });

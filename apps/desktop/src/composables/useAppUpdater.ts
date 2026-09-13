@@ -189,6 +189,13 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   function openLatestRelease() {
     openUrl(resolveUpdateReleaseUrl(updateInfo.value, settingsStore.editorSettings.updateDownloadSource, latestReleaseUrl));
   }
+  // Personalized fork: the Rust side answers every update request with this
+  // message (FORK_UPDATE_DISABLED_ERROR in src-tauri/src/commands/update.rs), so
+  // a blocked update is a normal state rather than a network failure.
+  function isForkUpdateDisabled(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    return message.includes("Auto-update is disabled in this personalized DBX build");
+  }
   function formatUpdateError(message: string): string {
     const lower = message.toLowerCase();
     if (lower.includes("cancel")) return t("updates.downloadCanceled");
@@ -199,11 +206,6 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   async function checkUpdates(checkOptions: { silent?: boolean } = {}) {
     if (disposed || isIgnoringUpdate.value) return;
     if (!checkOptions.silent) showUpdateDialog.value = true;
-    // Personalized fork: never contact the upstream feed. The official signed
-    // build would replace this customized app, and upstream now downloads
-    // updates in the background, so the check must not run at all.
-    if (!checkOptions.silent) updateCheckMessage.value = t("updates.disabledInFork");
-    return;
     if (phase.value !== "idle" || downloaded.value || (checkOptions.silent && !notificationsEnabled.value)) return;
     clearRetry();
     const token = ++generation;
@@ -221,6 +223,13 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     } catch (error) {
       if (token !== generation || disposed) return;
       phase.value = "idle";
+      // Personalized fork: the backend refuses to touch the official feed, so
+      // report that state instead of a retryable failure. Auto-update stays
+      // disabled; the message just explains why.
+      if (isForkUpdateDisabled(error)) {
+        updateCheckMessage.value = t("updates.disabledInFork");
+        return;
+      }
       fail(error);
       scheduleRetry();
     }

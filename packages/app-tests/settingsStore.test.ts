@@ -512,9 +512,10 @@ test("preserves adjacent tab shortcuts and persists unbound history actions when
   );
 });
 
-test("defaults sidebar activation to single click", () => {
-  assert.equal(DEFAULT_EDITOR_SETTINGS.sidebarActivation, "single");
-  assert.equal(normalizeEditorSettings({}).sidebarActivation, "single");
+// Personalized fork: single click only selects, double click opens/expands.
+test("defaults sidebar activation to double click", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.sidebarActivation, "double");
+  assert.equal(normalizeEditorSettings({}).sidebarActivation, "double");
 });
 
 test("preserves object browsing for legacy sidebar settings", () => {
@@ -663,7 +664,7 @@ test("keeps saved sidebar horizontal scroll preference", () => {
 
 test("keeps saved sidebar activation", () => {
   assert.equal(normalizeEditorSettings({ sidebarActivation: "double" } as any).sidebarActivation, "double");
-  assert.equal(normalizeEditorSettings({ sidebarActivation: "invalid" } as any).sidebarActivation, "single");
+  assert.equal(normalizeEditorSettings({ sidebarActivation: "invalid" } as any).sidebarActivation, "double");
 });
 
 test("normalizes saved sidebar hidden table prefixes", () => {
