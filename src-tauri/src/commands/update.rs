@@ -317,18 +317,20 @@ fn tag_version(version: &str) -> String {
     }
 }
 
+/// Shown when any update path is reached in this personalized build.
+const FORK_UPDATE_DISABLED_ERROR: &str =
+    "Auto-update is disabled in this personalized DBX build. Pull upstream and rebuild to update.";
+
 #[tauri::command]
 pub async fn check_for_updates(
     locale: Option<String>,
     source: Option<dbx_core::DownloadSource>,
 ) -> Result<UpdateInfo, String> {
-    let locale = locale.unwrap_or_else(|| "zh-CN".to_string());
-    let release = dbx_core::update::fetch_latest_release(&locale, source.unwrap_or_default()).await?;
-    let current_version = env!("CARGO_PKG_VERSION");
-    let mut info = dbx_core::update::build_update_info(release, current_version);
-    info.portable_mode = crate::data_dir::is_portable_mode();
-    info.manual_update_only = requires_manual_update(IS_WINDOWS_7_TARGET);
-    Ok(info)
+    // Personalized fork: the upstream feeds serve the official signed build,
+    // which would replace this customized app on install. Update fetching is
+    // disabled in the UI and here so no code path can reach the official feed.
+    let _ = (locale, source);
+    Err(FORK_UPDATE_DISABLED_ERROR.to_string())
 }
 
 fn requires_manual_update(is_windows_7_target: bool) -> bool {
