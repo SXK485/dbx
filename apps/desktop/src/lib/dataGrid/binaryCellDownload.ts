@@ -114,6 +114,8 @@ const HEX_ESCAPE_RE = /^(?:\\x[0-9a-fA-F]{2}|\s)+$/;
 const BINARY_TYPE_RE = /^(?:blob|tinyblob|mediumblob|longblob|bytea|bytes|binary|varbinary|image|raw|long\s+raw)(?:\b|\()/i;
 const FIXED_BINARY_TYPE_RE = /^binary(?:\b|\()/i;
 const BINARY_STRING_TYPE_RE = /^(?:binary|varbinary)(?:\b|\()/i;
+const VARBINARY_TYPE_RE = /^varbinary(?:\b|\()/i;
+const BLOB_TYPE_RE = /^(?:blob|tinyblob|mediumblob|longblob)(?:\b|\()/i;
 const MYSQL_FILE_IMPORT_TYPE_RE = /^(?:blob|tinyblob|mediumblob|longblob|binary|varbinary)(?:\b|\()/i;
 
 function copyBytesForBlob(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -159,7 +161,7 @@ function bytesFromBufferLikeObject(value: unknown): Uint8Array | null {
   return bytesFromByteArray(data);
 }
 
-export function parseBinaryCellBytes(value: unknown, columnType?: string): Uint8Array | null {
+export function parseBinaryCellBytes(value: unknown, columnType?: string, databaseType?: DatabaseType): Uint8Array | null {
   if (typeof value === "string") {
     const prefixed = parseBinaryCellHexValue(value);
     if (prefixed) return prefixed;
@@ -169,7 +171,7 @@ export function parseBinaryCellBytes(value: unknown, columnType?: string): Uint8
       return bytesFromHex(trimmed.replace(/\\x/gi, ""));
     }
 
-    if (isBinaryCellColumnType(columnType) && BARE_HEX_RE.test(trimmed)) {
+    if (databaseType !== "tdengine" && isBinaryCellColumnType(columnType) && BARE_HEX_RE.test(trimmed)) {
       return bytesFromHex(trimmed);
     }
   }
@@ -182,6 +184,11 @@ export function isBinaryCellColumnType(columnType?: string): boolean {
   return !!type && BINARY_TYPE_RE.test(type);
 }
 
+export function isBlobCellColumnType(columnType?: string): boolean {
+  const type = (columnType ?? "").trim();
+  return !!type && BLOB_TYPE_RE.test(type);
+}
+
 export function canImportBinaryCellFile(databaseType?: DatabaseType, columnType?: string): boolean {
   const type = (columnType ?? "").trim();
   if (databaseType === "postgres") return /^bytea(?:\b|\()/i.test(type);
@@ -189,23 +196,60 @@ export function canImportBinaryCellFile(databaseType?: DatabaseType, columnType?
   return false;
 }
 
-export function canDownloadBinaryCellValue(value: unknown, columnType?: string): boolean {
-  return !!parseBinaryCellBytes(value, columnType);
+export function canDownloadBinaryCellValue(value: unknown, columnType?: string, databaseType?: DatabaseType): boolean {
+  return !!parseBinaryCellBytes(value, columnType, databaseType);
 }
 
-export function binaryCellDisplayText(value: unknown, columnType?: string, originalBytes?: number): string | null {
+export function binaryCellDisplayText(value: unknown, columnType?: string, originalBytes?: number, databaseType?: DatabaseType): string | null {
   if (typeof value === "string" && isBinaryCellColumnType(columnType) && TRUNCATED_HEX_VALUE_RE.test(value.trim())) {
     const size = originalBytes === undefined ? "..." : formatBinaryCellByteSize(originalBytes);
     return `${binaryCellDisplayLabel(columnType)} [${size}]`;
   }
-  const bytes = parseBinaryCellBytes(value, columnType);
+  const bytes = parseBinaryCellBytes(value, columnType, databaseType);
   if (!bytes || !isBinaryCellColumnType(columnType)) return null;
-  if (BINARY_STRING_TYPE_RE.test((columnType ?? "").trim())) {
-    const previewBytes = FIXED_BINARY_TYPE_RE.test((columnType ?? "").trim()) ? trimTrailingNullBytes(bytes) : bytes;
-    const text = printableUtf8Text(previewBytes);
+  if (isBinaryCellTextPreviewColumn(columnType, databaseType)) {
+    const text = binaryCellUtf8TextBytes(bytes, columnType);
     if (text !== null) return text;
   }
   return `${binaryCellDisplayLabel(columnType)} [${formatBinaryCellByteSize(bytes.length)}]`;
+}
+
+export function binaryCellUtf8Text(value: unknown, columnType?: string, databaseType?: DatabaseType): string | null {
+  if (!isBinaryCellColumnType(columnType) || !isBinaryCellTextPreviewColumn(columnType, databaseType)) return null;
+  const bytes = parseBinaryCellBytes(value, columnType, databaseType);
+  if (!bytes) return null;
+  return binaryCellUtf8TextBytes(bytes, columnType);
+}
+
+// 复制到剪贴板时，把「文本型」MySQL VARBINARY 单元格还原成其原始字符串。
+// DBX 后端为保留任意 bytes，把该值统一序列化成 `0x<hex>`；前端只有在严格 UTF-8 解码、
+// 无控制字符且重新编码后与原 bytes 完全一致时，才把 payload（如 token）复制为文本。
+// 其余情况返回 null，让调用方沿用无损 hex。范围严格限定 MySQL VARBINARY，避免改变
+// MySQL BINARY/BLOB、SQL Server VARBINARY、PostgreSQL BYTEA、Oracle RAW 等现有语义。
+export function binaryCellClipboardText(value: unknown, columnType?: string, databaseType?: DatabaseType): string | null {
+  if (databaseType !== "mysql" || !VARBINARY_TYPE_RE.test((columnType ?? "").trim())) return null;
+  // MySQL QueryResult 的 binary canonical form 是 `0x<hex>`；不要把普通的偶数长度
+  // 文本（例如 "abcd"）猜测成 hex bytes。
+  const bytes = typeof value === "string" ? parseBinaryCellHexValue(value) : null;
+  if (!bytes) return null;
+  const text = binaryCellUtf8TextBytes(bytes, columnType);
+  if (text === null) return null;
+  const encoded = new TextEncoder().encode(text);
+  return encoded.length === bytes.length && encoded.every((byte, index) => byte === bytes[index]) ? text : null;
+}
+
+// MySQL BLOB 的文本预览必须与编辑写回路径（coerceMysqlBlobTextValue，仅 mysql）走同一闸门：
+// SQLite/DuckDB/H2/Firebird 等库同样暴露 `blob` 列，若一律按文本预览会出现
+// “显示是文本、编辑器却是十六进制”的不一致，故 blob 文本预览仅在 mysql 连接开启。
+// binary/varbinary 的文本预览早于该特性存在（如 TDengine BINARY 文本），保持全库通用。
+function isBinaryCellTextPreviewColumn(columnType: string | undefined, databaseType: DatabaseType | undefined): boolean {
+  if (BINARY_STRING_TYPE_RE.test((columnType ?? "").trim())) return true;
+  return isBlobCellColumnType(columnType) && databaseType === "mysql";
+}
+
+function binaryCellUtf8TextBytes(bytes: Uint8Array, columnType?: string): string | null {
+  const previewBytes = FIXED_BINARY_TYPE_RE.test((columnType ?? "").trim()) ? trimTrailingNullBytes(bytes) : bytes;
+  return printableUtf8Text(previewBytes);
 }
 
 function trimTrailingNullBytes(bytes: Uint8Array): Uint8Array {
@@ -245,8 +289,8 @@ export function formatBinaryCellByteSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
 
-export function binaryCellDownloadPayload(value: unknown, mode: BinaryCellDownloadMode, columnType?: string): BinaryCellDownloadPayload {
-  const bytes = parseBinaryCellBytes(value, columnType);
+export function binaryCellDownloadPayload(value: unknown, mode: BinaryCellDownloadMode, columnType?: string, databaseType?: DatabaseType): BinaryCellDownloadPayload {
+  const bytes = parseBinaryCellBytes(value, columnType, databaseType);
   if (!bytes) {
     throw new Error("Cell value is not a downloadable binary value.");
   }

@@ -168,6 +168,77 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     });
   });
 
+  it("shows a changed host-key prompt and updates the saved fingerprint", async () => {
+    await mountDialog();
+
+    const eventSource = MockEventSource.instances[0];
+    eventSource?.emit({
+      type: "prompt",
+      request: {
+        id: "changed-1",
+        kind: "HostKeyChanged",
+        host: "192.168.1.111",
+        port: 22,
+        key_type: "ssh-ed25519",
+        fingerprint: "SHA256:new-fingerprint",
+        previous_fingerprint: "SHA256:old-fingerprint",
+      },
+    });
+    await nextTick();
+
+    expect(document.body.textContent).toContain("Host fingerprint has changed");
+    expect(document.body.textContent).toContain("new-fingerprint");
+    expect(document.body.textContent).toContain("old-fingerprint");
+    expect(document.body.textContent).toContain("Saved fingerprint");
+
+    const buttons = [...document.body.querySelectorAll("button")].map((button) => button.textContent?.trim());
+    expect(buttons).toContain("Close");
+    expect(buttons).toContain("Continue");
+    expect(buttons).toContain("Update and Continue");
+
+    const update = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.trim() === "Update and Continue");
+    update?.click();
+
+    await vi.waitFor(() => {
+      expect(resolveSshPromptMock).toHaveBeenCalledWith({
+        id: "changed-1",
+        action: "accept",
+        remember: true,
+        secret: undefined,
+      });
+    });
+  });
+
+  it("continues a changed host key for this session only", async () => {
+    await mountDialog();
+
+    MockEventSource.instances[0]?.emit({
+      type: "prompt",
+      request: {
+        id: "changed-2",
+        kind: "HostKeyChanged",
+        host: "board.example.test",
+        port: 22,
+        key_type: "ssh-ed25519",
+        fingerprint: "SHA256:new",
+        previous_fingerprint: "SHA256:old",
+      },
+    });
+    await nextTick();
+
+    const cont = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.trim() === "Continue");
+    cont?.click();
+
+    await vi.waitFor(() => {
+      expect(resolveSshPromptMock).toHaveBeenCalledWith({
+        id: "changed-2",
+        action: "accept",
+        remember: false,
+        secret: undefined,
+      });
+    });
+  });
+
   it("clears prompts that are no longer pending after an SSE reconnect snapshot", async () => {
     await mountDialog();
 
@@ -236,6 +307,34 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     // A disconnect re-arms polling so prompts are not lost during the outage.
     eventSource?.error();
     expect(setSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows worker-upload consent buttons and wraps the digest and path", async () => {
+    await mountDialog();
+
+    const eventSource = MockEventSource.instances[0];
+    eventSource?.emit({
+      type: "prompt",
+      request: {
+        id: "worker-1",
+        kind: "WorkerUploadConsent",
+        host: "203.0.113.10",
+        port: 22,
+        fingerprint: "08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709",
+        prompt: "/home/testuser/.cache/dbx/sqlite-worker/session-ebd207de-8f26cd6e-08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709",
+      },
+    });
+    await nextTick();
+
+    expect(document.body.textContent).toContain("203.0.113.10:22");
+    expect(document.body.textContent).toContain("08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709");
+    expect(document.body.textContent).toContain("/home/testuser/.cache/dbx/sqlite-worker/");
+    expect(dialogSource).toContain("break-all");
+    expect(dialogSource).toContain("shrink-0");
+
+    const buttons = [...document.body.querySelectorAll("button")].map((button) => button.textContent?.trim());
+    expect(buttons).toContain("Cancel");
+    expect(buttons).toContain("Upload");
   });
 
   it("submits a keyboard-interactive TOTP challenge as a secret response", async () => {

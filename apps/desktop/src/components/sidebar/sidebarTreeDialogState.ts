@@ -14,6 +14,8 @@ export const fallbackCreateDatabaseCharset = fallbackCreateDatabaseCharsetMetada
 
 export const sidebarTreeDialogOwner = shallowRef<symbol | null>(null);
 export const sidebarDangerTarget = shallowRef<TreeNode | null>(null);
+export const sidebarDangerRunningExecutionId = ref<string>("");
+export const sidebarDangerRunningCancel = ref<(() => void | Promise<void>) | null>(null);
 export const sidebarFormTarget = shallowRef<TreeNode | null>(null);
 export const connectionDeleteTargetSnapshot = ref<ConnectionDeleteTarget[]>([]);
 export const connectionGroupDeleteTargetSnapshot = ref<ConnectionGroupDeleteTarget[]>([]);
@@ -35,7 +37,11 @@ export const structureDocCopyTitle = ref("");
 export const isLoadingStructurePreview = ref(false);
 export const showEmptyTableConfirm = ref(false);
 export const showTruncateTableConfirm = ref(false);
+export const showVacuumTableConfirm = ref(false);
 export const showMysqlAutoIncrementConfirm = ref(false);
+export const showBatchMysqlAutoIncrementConfirm = ref(false);
+export const batchMysqlAutoIncrementTargets = ref<TreeNode[]>([]);
+export const batchMysqlAutoIncrementPreviewSql = ref("");
 export const showRenameObjectDialog = ref(false);
 export const renameObjectName = ref("");
 export const renameObjectError = ref("");
@@ -46,6 +52,11 @@ export const batchDropCascade = ref(false);
 export const emptyTablePreviewSql = ref("");
 export const truncateTablePreviewSql = ref("");
 export const truncateTableCascade = ref(false);
+export const vacuumTableFull = ref(false);
+export const vacuumTableAnalyze = ref(false);
+export const vacuumTablePreviewSql = ref("");
+export const vacuumTablePreviewKey = ref("");
+export const vacuumTableExecuting = ref(false);
 export const mysqlAutoIncrementValue = ref("1");
 export const mysqlAutoIncrementPreviewSql = ref("");
 export const mysqlAutoIncrementPreviewKey = ref("");
@@ -88,6 +99,8 @@ export const showEditNacosNamespaceDialog = ref(false);
 export const editNacosNamespaceName = ref("");
 export const editNacosNamespaceDesc = ref("");
 export const editNacosNamespaceLoading = ref(false);
+export const showDeleteNacosNamespaceConfirm = ref(false);
+export const deleteNacosNamespaceLoading = ref(false);
 export const createDatabaseCharsetOptions = ref<string[]>(fallbackCreateDatabaseCharset.charsets);
 export const createDatabaseCollationsByCharset = ref<Record<string, string[]>>(fallbackCreateDatabaseCharset.collationsByCharset);
 export const createDatabaseCharsetLoading = ref(false);
@@ -153,6 +166,10 @@ export function resetMongoIndexManager() {
   mongoIndexManagerMode.value = "view";
   mongoEditIndexOriginalName.value = "";
 }
+export const showClearElasticsearchIndexConfirm = ref(false);
+export const clearElasticsearchIndexLoading = ref(false);
+/** Name typed back by the operator before a wildcard index node may be cleared. */
+export const clearElasticsearchIndexTypedName = ref("");
 export const showFlushRedisDbConfirm = ref(false);
 export const showRedisDatabaseAliasDialog = ref(false);
 export const redisDatabaseAliasInput = ref("");
@@ -185,7 +202,9 @@ const openFlags = [
   showStructureDocCopyDialog,
   showEmptyTableConfirm,
   showTruncateTableConfirm,
+  showVacuumTableConfirm,
   showMysqlAutoIncrementConfirm,
+  showBatchMysqlAutoIncrementConfirm,
   showDropObjectConfirm,
   showRenameObjectDialog,
   showDuplicateDialog,
@@ -202,6 +221,7 @@ const openFlags = [
   showDropAllMongoIndexesConfirm,
   showCreateMongoIndexDialog,
   showMongoIndexManagerDialog,
+  showClearElasticsearchIndexConfirm,
   showFlushRedisDbConfirm,
   showRedisDatabaseAliasDialog,
   showCreateSchemaDialog,
@@ -221,6 +241,8 @@ export function resetSidebarTreeDialogState() {
   createDatabasePreviewSql.value = "";
   createDatabaseAuthorizationResults.value = [];
   createDatabaseAuthorizationApplying.value = false;
+  clearElasticsearchIndexLoading.value = false;
+  clearElasticsearchIndexTypedName.value = "";
   redisDatabaseAliasInput.value = "";
   redisDatabaseAliasSaving.value = false;
   cloneMongoCollectionName.value = "";
@@ -228,9 +250,12 @@ export function resetSidebarTreeDialogState() {
   cloneMongoCollectionLoading.value = false;
   resetMongoCreateIndexForm();
   resetMongoIndexManager();
+  vacuumTableExecuting.value = false;
   sidebarTreeDialogOwner.value = null;
   sidebarDangerTarget.value = null;
   sidebarFormTarget.value = null;
+  sidebarDangerRunningExecutionId.value = "";
+  sidebarDangerRunningCancel.value = null;
   connectionDeleteTargetSnapshot.value = [];
   connectionGroupDeleteTargetSnapshot.value = [];
   deleteConnectionsWithGroup.value = false;

@@ -30,6 +30,7 @@ const {
   confirmDeleteGroup,
   showRenameObjectDialog,
   renameObjectName,
+  renameObjectDialogTitle,
   renameObjectPreviewSql,
   renameObjectError,
   confirmRenameObject,
@@ -95,6 +96,9 @@ const {
   editNacosNamespaceDesc,
   editNacosNamespaceLoading,
   confirmEditNacosNamespace,
+  showDeleteNacosNamespaceConfirm,
+  deleteNacosNamespaceLoading,
+  confirmDeleteNacosNamespace,
   showRenameMongoCollectionDialog,
   renameMongoCollectionName,
   renameMongoCollectionError,
@@ -195,6 +199,7 @@ watch(
     showEditDatabasePropertiesDialog,
     showCreateNacosNamespaceDialog,
     showEditNacosNamespaceDialog,
+    showDeleteNacosNamespaceConfirm,
     showRenameMongoCollectionDialog,
     showCloneMongoCollectionDialog,
     showCreateMongoIndexDialog,
@@ -270,12 +275,12 @@ watch(
   <Dialog v-model:open="showRenameObjectDialog">
     <DialogContent class="sm:max-w-[420px]">
       <DialogHeader>
-        <DialogTitle>{{ t("contextMenu.renameObjectTitle") }}</DialogTitle>
+        <DialogTitle>{{ renameObjectDialogTitle }}</DialogTitle>
       </DialogHeader>
       <div class="grid gap-3">
         <Input v-model="renameObjectName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" @keydown.enter.prevent="confirmRenameObject" />
-        <pre v-if="renameObjectPreviewSql" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
-        <p v-if="renameObjectError" class="text-sm text-destructive">{{ renameObjectError }}</p>
+        <pre v-if="renameObjectPreviewSql" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(renameObjectPreviewSql)"></pre>
+        <p v-if="renameObjectError" class="min-w-0 max-w-full overflow-x-auto text-sm text-destructive">{{ renameObjectError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" @click="showRenameObjectDialog = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -293,8 +298,8 @@ watch(
       </DialogHeader>
       <div class="grid gap-3">
         <Input v-model="renameMongoCollectionName" :placeholder="t('contextMenu.renameObjectNamePlaceholder')" :disabled="renameMongoCollectionLoading" @keydown.enter.prevent="confirmRenameMongoCollection" />
-        <pre v-if="renameMongoCollectionPreview" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">{{ renameMongoCollectionPreview }}</pre>
-        <p v-if="renameMongoCollectionError" class="text-sm text-destructive">{{ renameMongoCollectionError }}</p>
+        <pre v-if="renameMongoCollectionPreview" class="max-h-32 min-w-0 max-w-full overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap">{{ renameMongoCollectionPreview }}</pre>
+        <p v-if="renameMongoCollectionError" class="min-w-0 max-w-full overflow-x-auto text-sm text-destructive">{{ renameMongoCollectionError }}</p>
       </div>
       <DialogFooter>
         <Button variant="outline" :disabled="renameMongoCollectionLoading" @click="showRenameMongoCollectionDialog = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -736,6 +741,26 @@ watch(
         <Button variant="outline" :disabled="editNacosNamespaceLoading" @click="showEditNacosNamespaceDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="!editNacosNamespaceName.trim() || editNacosNamespaceLoading" @click="confirmEditNacosNamespace">
           {{ editNacosNamespaceLoading ? t("nacos.updatingNamespace") : t("dangerDialog.confirm") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showDeleteNacosNamespaceConfirm">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("nacos.deleteNamespace") }}</DialogTitle>
+      </DialogHeader>
+      <div class="flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
+        <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+        <p class="min-w-0 break-words text-muted-foreground [overflow-wrap:anywhere]">
+          {{ t("nacos.deleteNamespaceDescription", { name: node.nacosNamespaceName || node.label, id: node.nacosNamespace || "public" }) }}
+        </p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="deleteNacosNamespaceLoading" @click="showDeleteNacosNamespaceConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button variant="destructive" :disabled="deleteNacosNamespaceLoading" @click="confirmDeleteNacosNamespace">
+          {{ deleteNacosNamespaceLoading ? t("nacos.deletingNamespace") : t("dangerDialog.confirm") }}
         </Button>
       </DialogFooter>
     </DialogContent>

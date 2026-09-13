@@ -7,11 +7,11 @@ import { uuid } from "@/lib/common/utils";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { effectiveDatabaseTypeForConnection, connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema } from "@/lib/database/jdbcDialect";
 import { getCachedTableMetadata, loadTableMetadata, TABLE_METADATA_CACHE_TTL_MS, tableMetadataToDataTabMeta } from "@/lib/metadata/tableMetadataCache";
-import { canApplyDataTabMetadata, dataTabMetadataNeedsRefresh, findExistingDataTabCandidate, type DataTabOpenMode, type DataTabReuseMode } from "@/lib/sidebar/dataTabOpenPolicy";
+import { canApplyDataTabMetadata, dataTabMetadataNeedsRefresh, findExistingDataTabCandidate, isDataTabMetadataLifecycleStale, type DataTabOpenMode, type DataTabReuseMode } from "@/lib/sidebar/dataTabOpenPolicy";
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
-import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
 import { canActivateExistingDataTableTab } from "@/lib/tabs/dataTabActivation";
@@ -93,6 +93,11 @@ export function useSidebarDataOpenRuntime() {
       });
       try {
         if (ensureConnected) await connectionStore.ensureConnected(node.connectionId);
+        // 记录启动时的连接元数据代次：加载期间若跨过生命周期边界（disconnect /
+        // 关库 / 死池重连），结果已过期，不得写回 tab（PR #6640 review
+        // blocker 1 的 tab-local 半边——shared 缓存写回已有 per-scope 失效代
+        // 数保护，tab 写回此前没有）。
+        const metadataGenerationAtStart = connectionStore.metadataGenerationFor(node.connectionId, node.database);
         const loadedMetadata = await loadTableMetadata({
           connectionId: node.connectionId,
           database: node.database,
@@ -104,6 +109,15 @@ export function useSidebarDataOpenRuntime() {
           catalog: node.catalog,
           traceLogger: isDebugLoggingEnabled() ? (event) => openDataLog("debug", "metadata:trace", { sourceTraceId: traceId, ...event }) : undefined,
         });
+        if (connectionStore.metadataGenerationFor(node.connectionId, node.database) !== metadataGenerationAtStart) {
+          openDataLog("info", "metadata:superseded-by-connection-generation", {
+            traceId,
+            tabId: targetTabId,
+            columnCount: loadedMetadata.metadata.columns.length,
+            elapsed: elapsed(),
+          });
+          return;
+        }
         if (!canApplyTableMetadata(targetTabId)) {
           openDataLog("info", "metadata:stale", {
             traceId,
@@ -159,14 +173,26 @@ export function useSidebarDataOpenRuntime() {
     };
 
     if (existingSameTableTab && (existingSameTableTab.isExecuting || canActivateExistingDataTableTab(existingSameTableTab, { activateExecuting: false }))) {
+      if (node.comment !== undefined) existingSameTableTab.tableComment = node.comment;
+      const previousTableType = existingSameTableTab.tableMeta?.tableType?.trim().toUpperCase();
+      const tableTypeChanged = !!existingSameTableTab.tableMeta && previousTableType !== tableType;
+      if (tableTypeChanged) {
+        queryStore.setTableMeta(existingSameTableTab.id, {
+          ...existingSameTableTab.tableMeta!,
+          tableType,
+        });
+      }
       queryStore.switchTab(existingSameTableTab.id);
       logPhase("existing-tab-activated", { table: node.label });
-      if (dataTabMetadataNeedsRefresh(existingSameTableTab, DATA_TAB_METADATA_TTL_MS)) {
+      // 代次失配视同冷缓存（即使位于 30s TTL 窗口内也要重建）：disconnect /
+      // 关库 / 死池重连都可能不改变 timestamp 判定而改变连接生命周期
+      const connectionGeneration = connectionStore.metadataGenerationFor(node.connectionId, node.database);
+      if (tableTypeChanged || isDataTabMetadataLifecycleStale(existingSameTableTab, connectionGeneration) || dataTabMetadataNeedsRefresh(existingSameTableTab, DATA_TAB_METADATA_TTL_MS)) {
         // 真实列缺失时行标识未知：启动刷新的同时必须挂起编辑门控（所有
         // "真实列缺失且启动刷新"的入口统一置 pending）
         if (!existingSameTableTab.tableMeta?.columns.length) existingSameTableTab.tableMetaPending = true;
         void refreshTableMetaInBackground(existingSameTableTab.id, true);
-        logPhase("metadata-started", { tabId: existingSameTableTab.id, reason: "existing-tab-stale" });
+        logPhase("metadata-started", { tabId: existingSameTableTab.id, reason: tableTypeChanged ? "object-type-changed" : "existing-tab-stale" });
       }
       return;
     }
@@ -175,12 +201,16 @@ export function useSidebarDataOpenRuntime() {
       if (existingDataTabCandidate) {
         queryStore.switchTab(existingDataTabCandidate.tab.id);
         resetReusedDataTabState(existingDataTabCandidate.tab);
+        existingDataTabCandidate.tab.tableComment = node.comment;
         return existingDataTabCandidate.tab.id;
       }
-      return queryStore.createTab(node.connectionId, node.database, node.label, "data", tableSchema, undefined, node.catalog, {
+      const createdTabId = queryStore.createTab(node.connectionId, node.database, node.label, "data", tableSchema, undefined, node.catalog, {
         forceNew: true,
         insertAfterActive: settingsStore.editorSettings.openDataTabsNextToActive,
       });
+      const createdTab = queryStore.tabs.find((tab) => tab.id === createdTabId);
+      if (createdTab) createdTab.tableComment = node.comment;
+      return createdTabId;
     })();
     openDataLog("info", "tab-created", { traceId, tabId, elapsed: elapsed() });
     logPhase("tab-created", { tabId });
@@ -317,7 +347,7 @@ export function useSidebarDataOpenRuntime() {
       const loadedTableMeta = cachedTableMeta ?? queryStore.tabs.find((item) => item.id === tabId)?.tableMeta;
       const columns = loadedTableMeta?.columns ?? [];
       const primaryKeys = loadedTableMeta?.primaryKeys ?? [];
-      const includeRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, tableType);
+      const includeRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, tableType);
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
         driverProfile: config?.driver_profile,
@@ -330,8 +360,10 @@ export function useSidebarDataOpenRuntime() {
         columns: columns.map((column) => column.name),
         primaryKeys,
         ...tableDataLargeValuePreviewOptions(effectiveDbType, columns, primaryKeys, limit),
+        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
         limit,
         includeRowId,
+        injectDefaultTimeSeriesWhere: true,
       });
       // SQL 构建是异步后端调用：期间更晚的导航（openData/openTableTarget）
       // 接管会替换 executionId，旧流程不得再覆盖 SQL/启动查询

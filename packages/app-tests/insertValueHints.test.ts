@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { buildInsertValueHints, expandToSqlStatementWindow, parseInsertValueHints, parseInsertValueHintsInRanges, parseInsertValuesClauses } from "../../apps/desktop/src/lib/sql/insertValueHints.ts";
+import { buildInsertValueHints, expandToSqlStatementWindow, findEnclosingDollarQuoteStart, parseInsertValueHints, parseInsertValueHintsInRanges, parseInsertValuesClauses } from "../../apps/desktop/src/lib/sql/insertValueHints.ts";
 import { insertValueHintColumnNames } from "../../apps/desktop/src/lib/sql/insertValueHintColumns.ts";
 
 /**
@@ -14,11 +14,85 @@ function assertSublinearScaling(measureAt: (scale: number) => number, options: {
   const { smallScale, bigScale, maxRatio, maxMs, label } = options;
   const smallMs = measureAt(smallScale);
   const bigMs = measureAt(bigScale);
-  assert.ok(
-    bigMs < Math.max(maxMs, smallMs * maxRatio),
-    `${label}: ${smallScale}x took ${smallMs.toFixed(1)}ms, ${bigScale}x took ${bigMs.toFixed(1)}ms -- expected roughly bounded, not scaling with document size`,
-  );
+  assert.ok(bigMs < Math.max(maxMs, smallMs * maxRatio), `${label}: ${smallScale}x took ${smallMs.toFixed(1)}ms, ${bigScale}x took ${bigMs.toFixed(1)}ms -- expected roughly bounded, not scaling with document size`);
 }
+
+test("findEnclosingDollarQuoteStart locates the opening tag inside a PostgreSQL procedure body", () => {
+  const prefix = "CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n";
+  const sql = `${prefix}INSERT INTO users (id, name) SELECT src_id, src_name FROM staging;\nEND;\n$$;`;
+  const dollarOpen = sql.indexOf("$$");
+  assert.equal(findEnclosingDollarQuoteStart(sql, prefix.length + 10), dollarOpen);
+  assert.equal(findEnclosingDollarQuoteStart(sql, sql.indexOf("SELECT src_id")), dollarOpen);
+  assert.equal(findEnclosingDollarQuoteStart(sql, 0), null);
+  assert.equal(findEnclosingDollarQuoteStart(sql, dollarOpen), null);
+});
+
+test("insert hints isolate INSERT ... SELECT inside a dollar-quoted procedure when the slice would include the opening tag", () => {
+  const prefix = "CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n";
+  const insert = "INSERT INTO users (id, name) SELECT src_id, src_name FROM staging;";
+  const sql = `${prefix}${insert}\nEND;\n$$;`;
+  const cursor = sql.indexOf("INSERT");
+  let sliceFrom = 0;
+  const dollarStart = findEnclosingDollarQuoteStart(sql, cursor);
+  assert.equal(dollarStart, sql.indexOf("$$"));
+  const openingTag = "$$";
+  sliceFrom = Math.max(sliceFrom, dollarStart! + openingTag.length);
+  const slice = sql.slice(sliceFrom);
+  const relativeCursor = cursor - sliceFrom;
+  const window = expandToSqlStatementWindow(slice, relativeCursor, relativeCursor, "postgres");
+  const hints = buildInsertValueHints(parseInsertValuesClauses(slice.slice(window.from, window.to), "postgres"));
+  assert.deepEqual(
+    hints.map((hint) => hint.column),
+    ["id", "name"],
+  );
+});
+
+test("slice adjustment probes viewport end when start is still before the opening dollar tag", () => {
+  const header = "CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS ";
+  const prefix = `${header}$$\nBEGIN\n`;
+  const insert = "INSERT INTO users (id, name) SELECT src_id, src_name FROM staging;";
+  const sql = `${prefix}${insert}\nEND;\n$$;`;
+  const viewportFrom = 0;
+  const viewportTo = sql.indexOf("SELECT src_id") + 4;
+  const probePos = Math.min(sql.length, Math.max(viewportFrom, viewportTo));
+  assert.equal(findEnclosingDollarQuoteStart(sql, viewportFrom), null);
+  const dollarStart = findEnclosingDollarQuoteStart(sql, probePos) ?? findEnclosingDollarQuoteStart(sql, viewportFrom);
+  assert.equal(dollarStart, sql.indexOf("$$"));
+  let sliceFrom = 0;
+  sliceFrom = Math.max(sliceFrom, dollarStart! + "$$".length);
+  const slice = sql.slice(sliceFrom);
+  const relativeInsert = sql.indexOf("INSERT") - sliceFrom;
+  const window = expandToSqlStatementWindow(slice, relativeInsert, relativeInsert, "postgres");
+  const hints = buildInsertValueHints(parseInsertValuesClauses(slice.slice(window.from, window.to), "postgres"));
+  assert.deepEqual(
+    hints.map((hint) => hint.column),
+    ["id", "name"],
+  );
+});
+
+test("findEnclosingDollarQuoteStart supports custom procedure tags", () => {
+  const prefix = "CREATE PROCEDURE p() AS $procedure$\nBEGIN\n";
+  const sql = `${prefix}INSERT INTO t (a) SELECT x FROM s;\nEND;\n$procedure$;`;
+  const tagOpen = sql.indexOf("$procedure$");
+  assert.equal(findEnclosingDollarQuoteStart(sql, sql.indexOf("INSERT")), tagOpen);
+  assert.equal(findEnclosingDollarQuoteStart(sql, sql.indexOf("SELECT x")), tagOpen);
+});
+
+test("findEnclosingDollarQuoteStart detects bodies when the opening tag spans a scan chunk boundary", () => {
+  const pad = "x".repeat(64 * 1024 - 1);
+  const opening = "$$";
+  const body = "BEGIN\nINSERT INTO t (a) SELECT x FROM s;\nEND;\n";
+  const sql = `${pad}${opening}${body}`;
+  const cursor = sql.indexOf("INSERT") + 5;
+  assert.equal(findEnclosingDollarQuoteStart(sql, cursor), pad.length);
+});
+
+test("findEnclosingDollarQuoteStart does not reopen a tag after chunk-extension overlap", () => {
+  const pad = "x".repeat(64 * 1024 - 1);
+  const sql = `${pad}$$ short $$`;
+  assert.equal(findEnclosingDollarQuoteStart(sql, pad.length + 4), pad.length);
+  assert.equal(findEnclosingDollarQuoteStart(sql, sql.length), null);
+});
 
 test("maps explicit column list to single-row VALUES", () => {
   const sql = "INSERT INTO auth_user (id, password, last_login) VALUES (5, 'hash', NULL)";
@@ -88,11 +162,7 @@ test("resolves columns from table metadata when column list is omitted", () => {
 
 test("skips SQL Server identity columns when mapping multi-row VALUES without a column list", () => {
   const sql = "INSERT INTO dbo.users VALUES (N'A', 1), (N'B', 2)";
-  const columns = insertValueHintColumnNames("sqlserver", [
-    { name: "id", is_identity: true },
-    { name: "name" },
-    { name: "status" },
-  ]);
+  const columns = insertValueHintColumnNames("sqlserver", [{ name: "id", is_identity: true }, { name: "name" }, { name: "status" }]);
   const hints = parseInsertValueHints(sql, {
     resolveTableColumns: () => columns,
   });
@@ -116,30 +186,110 @@ test("skips SQL Server computed and temporal generated columns in positional hin
 });
 
 test("skips visible SQL Server generated columns in positional hints", () => {
-  assert.deepEqual(
-    insertValueHintColumnNames("sqlserver", [
-      { name: "name" },
-      { name: "valid_from", generated_always_type: 1 },
-      { name: "valid_to", generated_always_type: 2 },
-    ]),
-    ["name"],
-  );
+  assert.deepEqual(insertValueHintColumnNames("sqlserver", [{ name: "name" }, { name: "valid_from", generated_always_type: 1 }, { name: "valid_to", generated_always_type: 2 }]), ["name"]);
 });
 
 test("keeps identity columns in positional hints for databases other than SQL Server", () => {
+  assert.deepEqual(insertValueHintColumnNames("postgres", [{ name: "id", is_identity: true }, { name: "name" }]), ["id", "name"]);
+});
+
+test("maps INSERT ... SELECT projections to explicit target columns", () => {
+  const sql = "INSERT INTO dbo.users (id, name) SELECT source_id, source_name FROM staging";
+  const hints = parseInsertValueHints(sql);
   assert.deepEqual(
-    insertValueHintColumnNames("postgres", [
-      { name: "id", is_identity: true },
-      { name: "name" },
-    ]),
-    ["id", "name"],
+    hints.map((hint) => ({ column: hint.column, text: sql.slice(hint.from).split(/[ ,]/u, 1)[0] })),
+    [
+      { column: "id", text: "source_id" },
+      { column: "name", text: "source_name" },
+    ],
   );
 });
 
-test("returns no hints for INSERT ... SELECT", () => {
-  const sql = "INSERT INTO users (id, name) SELECT id, name FROM staging";
-  assert.deepEqual(parseInsertValueHints(sql), []);
-  assert.deepEqual(parseInsertValuesClauses(sql), []);
+test("skips SELECT modifiers and does not split nested projection expressions", () => {
+  const sql = "INSERT INTO dbo.users (name, row_count) SELECT DISTINCT TOP (10) COALESCE(first_name, last_name), COUNT(*) FROM staging";
+  const hints = parseInsertValueHints(sql);
+  assert.deepEqual(
+    hints.map((hint) => hint.column),
+    ["name", "row_count"],
+  );
+  assert.ok(sql.slice(hints[0]!.from).startsWith("COALESCE(first_name, last_name)"));
+  assert.ok(sql.slice(hints[1]!.from).startsWith("COUNT(*)"));
+});
+
+test("resolves filtered SQL Server target columns for INSERT ... SELECT without a column list", () => {
+  const sql = "INSERT INTO dbo.users SELECT source_name, source_status FROM staging";
+  const columns = insertValueHintColumnNames("sqlserver", [{ name: "id", is_identity: true }, { name: "name" }, { name: "doubled", is_computed: true }, { name: "status" }, { name: "valid_from", generated_always_type: 1 }]);
+  const hints = parseInsertValueHints(sql, { resolveTableColumns: () => columns });
+  assert.deepEqual(
+    hints.map((hint) => hint.column),
+    ["name", "status"],
+  );
+});
+
+test("returns no positional hints for wildcard INSERT ... SELECT projections", () => {
+  for (const sql of ["INSERT INTO users (id, name) SELECT * FROM staging", "INSERT INTO users (id, name) SELECT source.* FROM staging source"]) {
+    assert.deepEqual(parseInsertValueHints(sql), []);
+    assert.deepEqual(parseInsertValuesClauses(sql), []);
+  }
+});
+
+test("caps INSERT ... SELECT hints to the smaller target or projection count", () => {
+  assert.deepEqual(
+    parseInsertValueHints("INSERT INTO t (a, b) SELECT x, y, z FROM source").map((hint) => hint.column),
+    ["a", "b"],
+  );
+  assert.deepEqual(
+    parseInsertValueHints("INSERT INTO t (a, b, c) SELECT x, y FROM source").map((hint) => hint.column),
+    ["a", "b"],
+  );
+});
+
+test("maps INSERT ... SELECT DISTINCT ON projections after skipping the ON clause", () => {
+  const sql = "INSERT INTO t (a, b) SELECT DISTINCT ON (x) y, z FROM s";
+  const hints = parseInsertValueHints(sql);
+  assert.deepEqual(
+    hints.map((hint) => ({ column: hint.column, text: sql.slice(hint.from).split(/[ ,]/u, 1)[0] })),
+    [
+      { column: "a", text: "y" },
+      { column: "b", text: "z" },
+    ],
+  );
+});
+
+test("maps INSERT ... SELECT inside parenthesized source query", () => {
+  const sql = "INSERT INTO t (a, b) (SELECT x, y FROM z)";
+  const hints = parseInsertValueHints(sql);
+  assert.deepEqual(
+    hints.map((hint) => ({ column: hint.column, text: sql.slice(hint.from).split(/[ ,]/u, 1)[0] })),
+    [
+      { column: "a", text: "x" },
+      { column: "b", text: "y" },
+    ],
+  );
+});
+
+test("maps INSERT ... SELECT with a CTE source query", () => {
+  const sql = "INSERT INTO t (a, b) WITH tmp AS (SELECT 1) SELECT x, y FROM tmp";
+  const hints = parseInsertValueHints(sql);
+  assert.deepEqual(
+    hints.map((hint) => ({ column: hint.column, text: sql.slice(hint.from).split(/[ ,]/u, 1)[0] })),
+    [
+      { column: "a", text: "x" },
+      { column: "b", text: "y" },
+    ],
+  );
+});
+
+test("maps INSERT ... SELECT UNION only to the first SELECT branch", () => {
+  const sql = "INSERT INTO t (a, b) SELECT x, y FROM s1 UNION SELECT u, v FROM s2";
+  const hints = parseInsertValueHints(sql);
+  assert.deepEqual(
+    hints.map((hint) => ({ column: hint.column, text: sql.slice(hint.from).split(/[ ,]/u, 1)[0] })),
+    [
+      { column: "a", text: "x" },
+      { column: "b", text: "y" },
+    ],
+  );
 });
 
 test("caps hints when value count exceeds column count", () => {
@@ -252,11 +402,7 @@ test("expandToSqlStatementWindow proves clean state when the cursor is more than
   const sql = `CREATE FUNCTION f() RETURNS void AS $$ ${body} $$ LANGUAGE sql;`;
   const cursor = sql.indexOf(body) + 40_000;
   const window = expandToSqlStatementWindow(sql, cursor, cursor);
-  assert.equal(
-    window.from,
-    0,
-    "semicolons inside a dollar-quoted function body are not statement boundaries, even past the lookback window",
-  );
+  assert.equal(window.from, 0, "semicolons inside a dollar-quoted function body are not statement boundaries, even past the lookback window");
 });
 
 test("expandToSqlStatementWindow proves clean state when the cursor is more than 32KiB into deeply nested parens", () => {
@@ -266,11 +412,7 @@ test("expandToSqlStatementWindow proves clean state when the cursor is more than
   const sql = `SELECT ${opens}${junk}${closes};`;
   const cursor = sql.indexOf(junk) + junk.length - 100;
   const window = expandToSqlStatementWindow(sql, cursor, cursor);
-  assert.equal(
-    window.from,
-    0,
-    "a ';' more than 32KiB past unclosed '(' characters is still nested, not a top-level statement boundary",
-  );
+  assert.equal(window.from, 0, "a ';' more than 32KiB past unclosed '(' characters is still nested, not a top-level statement boundary");
 });
 
 test("expandToSqlStatementWindow stays bounded (fast path) for many small statements even far into the document", () => {
@@ -338,22 +480,14 @@ test("expandToSqlStatementWindow does not treat a backslash-escaped quote as clo
   const sql = "SELECT 'it\\'s a test; end' FROM t;";
   const cursor = sql.indexOf("FROM") + 2;
   const window = expandToSqlStatementWindow(sql, cursor, cursor);
-  assert.equal(
-    sql.slice(window.from, window.to),
-    "SELECT 'it\\'s a test; end' FROM t",
-    "the ';' inside the backslash-escaped string must not be mistaken for the statement boundary",
-  );
+  assert.equal(sql.slice(window.from, window.to), "SELECT 'it\\'s a test; end' FROM t", "the ';' inside the backslash-escaped string must not be mistaken for the statement boundary");
 });
 
 test("expandToSqlStatementWindow terminates a line comment at a bare '\\r' (no trailing '\\n')", () => {
   const sql = "SELECT 1; -- comment\rSELECT 2;";
   const cursor = sql.indexOf("SELECT 2") + 4;
   const window = expandToSqlStatementWindow(sql, cursor, cursor);
-  assert.equal(
-    sql.slice(window.from, window.to),
-    "-- comment\rSELECT 2",
-    "the comment must end at '\\r' so the trailing ';' is recognized as the real statement boundary",
-  );
+  assert.equal(sql.slice(window.from, window.to), "-- comment\rSELECT 2", "the comment must end at '\\r' so the trailing ';' is recognized as the real statement boundary");
 });
 
 test("expandToSqlStatementWindow finds the real end of a single statement larger than one lookahead window, instead of truncating", () => {

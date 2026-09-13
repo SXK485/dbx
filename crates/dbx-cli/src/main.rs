@@ -65,8 +65,10 @@ const BRIDGE_REQUIRED_TYPES: &[&str] = &[
     "neo4j",
     "cassandra",
     "bigquery",
+    "spanner",
     "kylin",
     "ignite",
+    "ignite3",
     "sundb",
     "oscar",
     "xugu",
@@ -176,6 +178,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(argv: Vec<String>) -> Result<String, (CliError, bool)> {
+    // Set aws_lc_rs as the process-level default CryptoProvider to prevent a rustls panic
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let wants_json = argv.iter().any(|arg| arg == "--json");
     let flags = parse_flags(&argv).map_err(|error| (error, wants_json))?;
     let json_output = flags.format == OutputFormat::Json;

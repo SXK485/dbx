@@ -25,13 +25,39 @@ impl AgentSessionRole {
 
 fn agent_jdbc_driver_class(config: &ConnectionConfig) -> &str {
     let driver_class = config.jdbc_driver_class.as_deref().unwrap_or("");
-    if config.db_type == DatabaseType::H2
+    if (config.db_type == DatabaseType::H2 && !h2_uses_custom_driver(config))
         || (config.db_type == DatabaseType::SapHana && matches!(driver_class, "sap_hana" | "saphana"))
     {
         ""
     } else {
         driver_class
     }
+}
+
+fn agent_jdbc_driver_paths(config: &ConnectionConfig) -> &[String] {
+    if config.db_type == DatabaseType::H2 && !h2_uses_custom_driver(config) {
+        &[]
+    } else {
+        &config.jdbc_driver_paths
+    }
+}
+
+fn h2_uses_custom_driver(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::H2
+        && config.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("h2-custom"))
+}
+
+fn cassandra_tls_field<'a>(config: &'a ConnectionConfig, field: &str) -> &'a str {
+    if config.db_type != DatabaseType::Cassandra {
+        return "";
+    }
+    config
+        .external_config
+        .as_ref()
+        .and_then(|value| value.get("tls"))
+        .and_then(|value| value.get(field))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 pub fn agent_connect_params(
@@ -107,13 +133,18 @@ pub fn agent_connect_params_with_role(
         "ca_cert_path": config.ca_cert_path,
         "client_cert_path": config.client_cert_path,
         "client_key_path": config.client_key_path,
+        "truststore_path": cassandra_tls_field(config, "truststore_path"),
+        "truststore_password": cassandra_tls_field(config, "truststore_password"),
+        "keystore_path": cassandra_tls_field(config, "keystore_path"),
+        "keystore_password": cassandra_tls_field(config, "keystore_password"),
         "connect_timeout_secs": config.effective_connect_timeout_secs(),
         "etcd_endpoints": etcd_endpoints,
         "zookeeper_connect_string": zookeeper_connect_string,
         "gbase_server": config.gbase_server,
         "informix_server": config.informix_server,
         "jdbc_driver_class": agent_jdbc_driver_class(config),
-        "jdbc_driver_paths": &config.jdbc_driver_paths,
+        "jdbc_driver_paths": agent_jdbc_driver_paths(config),
+        "driver_profile": config.driver_profile.as_deref().unwrap_or(""),
         "sessionRole": session_role.as_str(),
         "database_type": config.db_type,
     });
@@ -647,7 +678,8 @@ fn append_agent_url_params(base: String, params: Option<&str>) -> String {
 }
 
 pub fn hive_uses_zookeeper_discovery(config: &ConnectionConfig) -> bool {
-    if !matches!(config.db_type, DatabaseType::Hive | DatabaseType::Kyuubi | DatabaseType::Impala) {
+    if !matches!(config.db_type, DatabaseType::Hive | DatabaseType::Kyuubi | DatabaseType::Impala | DatabaseType::Argo)
+    {
         return false;
     }
 
@@ -698,6 +730,7 @@ mod tests {
             database: database.map(str::to_string),
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -725,10 +758,16 @@ mod tests {
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -758,6 +797,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["sessionRole"], "metadata");
+    }
+
+    #[test]
+    fn cassandra_agent_connect_params_include_tls_stores() {
+        let mut cfg = config(DatabaseType::Cassandra, Some("app"));
+        cfg.ssl = true;
+        cfg.external_config = Some(serde_json::json!({
+            "tls": {
+                "truststore_path": "/certs/client.truststore",
+                "truststore_password": "trust-secret",
+                "keystore_path": "/certs/client.keystore",
+                "keystore_password": "key-secret"
+            }
+        }));
+
+        let params = agent_connect_params(&cfg, "cassandra.example.com", 9042, "app").unwrap();
+
+        assert_eq!(params["truststore_path"], "/certs/client.truststore");
+        assert_eq!(params["truststore_password"], "trust-secret");
+        assert_eq!(params["keystore_path"], "/certs/client.keystore");
+        assert_eq!(params["keystore_password"], "key-secret");
+    }
+
+    #[test]
+    fn oracle_form_connections_use_orcl_when_database_is_omitted() {
+        for (mode, expected_url) in [
+            ("service_name", "jdbc:oracle:thin:@//oracle.example.com:1521/ORCL"),
+            ("sid", "jdbc:oracle:thin:@oracle.example.com:1521:ORCL"),
+        ] {
+            let mut cfg = config(DatabaseType::Oracle, None);
+            cfg.oracle_connection_type = Some(mode.to_string());
+            let database = cfg.effective_database().unwrap_or("");
+
+            let params = agent_connect_params(&cfg, "oracle.example.com", 1521, database).unwrap();
+
+            assert_eq!(params["database"], "ORCL");
+            assert_eq!(params["connection_string"], expected_url);
+        }
     }
 
     #[test]
@@ -856,16 +933,34 @@ mod tests {
     }
 
     #[test]
-    fn h2_agent_connect_params_ignore_stale_driver_class() {
-        for driver_profile in [None, Some("h2-legacy")] {
+    fn h2_bundled_agent_connect_params_ignore_stale_custom_driver_config() {
+        for driver_profile in
+            [None, Some("h2"), Some("h2-auto"), Some("h2-legacy"), Some("h2-v1"), Some("h2-v2"), Some("h2-v3")]
+        {
             let mut cfg = config(DatabaseType::H2, Some("test"));
             cfg.driver_profile = driver_profile.map(str::to_string);
             cfg.jdbc_driver_class = Some("h2_embedded".to_string());
+            cfg.jdbc_driver_paths = vec!["/tmp/stale-h2.jar".to_string()];
 
             let params = agent_connect_params(&cfg, "127.0.0.1", 9092, "test").unwrap();
 
             assert_eq!(params["jdbc_driver_class"], "");
+            assert_eq!(params["jdbc_driver_paths"], serde_json::json!([]));
         }
+    }
+
+    #[test]
+    fn h2_custom_agent_connect_params_preserve_external_driver_config() {
+        let mut cfg = config(DatabaseType::H2, Some("test"));
+        cfg.driver_profile = Some("h2-custom".to_string());
+        cfg.jdbc_driver_class = Some("org.h2.Driver".to_string());
+        cfg.jdbc_driver_paths = vec!["/tmp/h2-custom.jar".to_string(), "/tmp/h2-helper.jar".to_string()];
+
+        let params = agent_connect_params(&cfg, "127.0.0.1", 9092, "test").unwrap();
+
+        assert_eq!(params["driver_profile"], "h2-custom");
+        assert_eq!(params["jdbc_driver_class"], "org.h2.Driver");
+        assert_eq!(params["jdbc_driver_paths"], serde_json::json!(["/tmp/h2-custom.jar", "/tmp/h2-helper.jar"]));
     }
 
     #[test]
@@ -876,6 +971,26 @@ mod tests {
 
         assert_eq!(params["database"], "postgres");
         assert_eq!(params["connection_string"], "jdbc:vastbase://vastbase.example.com:5432/postgres");
+    }
+
+    #[test]
+    fn kingbase_agent_params_keep_legacy_postgres_default_when_database_is_empty() {
+        let cfg = config(DatabaseType::Kingbase, None);
+
+        let params = agent_connect_params(&cfg, "kingbase.example.com", 54321, "").unwrap();
+
+        assert_eq!(params["database"], "postgres");
+        assert_eq!(params["connection_string"], "jdbc:kingbase8://kingbase.example.com:54321/postgres");
+    }
+
+    #[test]
+    fn kingbase_agent_params_preserve_explicit_database() {
+        let cfg = config(DatabaseType::Kingbase, Some("application"));
+
+        let params = agent_connect_params(&cfg, "kingbase.example.com", 54321, "application").unwrap();
+
+        assert_eq!(params["database"], "application");
+        assert_eq!(params["connection_string"], "jdbc:kingbase8://kingbase.example.com:54321/application");
     }
 
     #[test]

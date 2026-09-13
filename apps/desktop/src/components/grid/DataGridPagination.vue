@@ -16,6 +16,7 @@ const props = withDefaults(
     paginationEnabled?: boolean;
     selectionSummary: { cellCount: number; rowCount: number } | null;
     selectionSummarySumText: string;
+    selectionSummaryAverageText: string;
     loading: boolean;
     infiniteScrollEnabled: boolean;
     infiniteScrollAllLoaded: boolean;
@@ -86,12 +87,13 @@ function handlePageInputKeydown(event: KeyboardEvent) {
   <div class="flex min-w-max items-center justify-end gap-1">
     <div v-if="selectionSummary" class="flex shrink-0 items-center gap-3 tabular-nums">
       <span class="shrink-0">{{ t("grid.selectionSum", { value: selectionSummarySumText }) }}</span>
+      <span class="shrink-0">{{ t("grid.selectionAverage", { value: selectionSummaryAverageText }) }}</span>
       <div class="flex shrink-0 items-center gap-1">
         <span class="shrink-0">{{ t("grid.selectionCells", { count: selectionSummary.cellCount }) }}</span>
         <span class="shrink-0">{{ t("grid.rows", { count: selectionSummary.rowCount }) }}</span>
       </div>
     </div>
-    <Loader2 v-if="loading" class="w-3 h-3 animate-spin text-muted-foreground" />
+    <Loader2 class="w-3 h-3 text-muted-foreground" :class="loading ? 'animate-spin' : 'invisible'" aria-hidden="true" />
     <template v-if="paginationEnabled && infiniteScrollEnabled">
       <span v-if="infiniteScrollAllLoaded" class="text-xs text-muted-foreground shrink-0">{{ t("grid.allLoaded") }}</span>
     </template>

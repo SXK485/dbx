@@ -19,6 +19,10 @@ pub(super) enum StructureDialect {
     ManticoreSearch,
     Informix,
     Questdb,
+    // GaussDB M 模式：MySQL 兼容方言，使用反引号引用标识符。DDL 行为接近 MySQL，
+    // 但使用 UBTREE 索引类型（而非 BTREE），不支持 INCLUDE/FILTER 等。
+    // DROP INDEX 使用 PostgreSQL 风格（DROP INDEX name），而非 MySQL 的 DROP INDEX name ON table。
+    GaussdbM,
     Unsupported,
 }
 
@@ -39,6 +43,7 @@ pub(super) struct TableStructureCapabilities {
     pub(super) index_filter: bool,
     pub(super) index_comment: bool,
     pub(super) index_concurrent: bool,
+    pub(super) add_primary_key: bool,
     pub(super) alter_primary_key: bool,
     pub(super) foreign_key: bool,
 }
@@ -61,13 +66,37 @@ impl Default for TableStructureCapabilities {
             index_filter: false,
             index_comment: false,
             index_concurrent: false,
+            add_primary_key: false,
             alter_primary_key: false,
             foreign_key: false,
         }
     }
 }
 
-pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStructureCapabilities {
+pub(super) fn gaussdb_m_capabilities() -> TableStructureCapabilities {
+    TableStructureCapabilities {
+        dialect: StructureDialect::GaussdbM,
+        add_column: true,
+        drop_column: true,
+        rename_column: true,
+        alter_existing_column: true,
+        reorder_column: true,
+        comment: true,
+        create_index: true,
+        drop_index: true,
+        rebuild_index: true,
+        index_type: true,
+        index_comment: true,
+        add_primary_key: true,
+        alter_primary_key: true,
+        ..TableStructureCapabilities::default()
+    }
+}
+
+pub(super) fn capabilities_for(
+    database_type: Option<DatabaseType>,
+    driver_profile: Option<&str>,
+) -> TableStructureCapabilities {
     let base = TableStructureCapabilities::default();
     match database_type {
         Some(
@@ -89,6 +118,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             rebuild_index: true,
             index_type: true,
             index_comment: true,
+            add_primary_key: true,
             alter_primary_key: true,
             foreign_key: true,
             ..base
@@ -102,6 +132,23 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             comment: true,
             ..base
         },
+        // GBase 8s is Informix-compatible, unlike the rest of the `Gbase`
+        // family (GBase 8a and friends) which speak MySQL wire protocol and
+        // SQL dialect. `driver_profile` is the only signal that distinguishes
+        // them (see the same check in `table_export.rs` / `table_select.rs`).
+        Some(DatabaseType::Gbase) if driver_profile.is_some_and(|profile| profile.eq_ignore_ascii_case("gbase8s")) => {
+            TableStructureCapabilities {
+                dialect: StructureDialect::Informix,
+                add_column: true,
+                drop_column: true,
+                rename_column: true,
+                alter_existing_column: true,
+                create_index: true,
+                drop_index: true,
+                rebuild_index: true,
+                ..base
+            }
+        }
         Some(DatabaseType::Gbase) => TableStructureCapabilities {
             dialect: StructureDialect::Mysql,
             add_column: true,
@@ -135,6 +182,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
                 index_include: true,
                 index_filter: true,
                 index_comment: true,
+                add_primary_key: true,
                 alter_primary_key: true,
                 foreign_key: true,
                 ..base
@@ -165,6 +213,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             index_filter: false,
             index_comment: false,
             index_concurrent: false,
+            add_primary_key: false,
             alter_primary_key: false,
             foreign_key: false,
         },
@@ -226,6 +275,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             drop_index: true,
             rebuild_index: true,
             index_type: true,
+            add_primary_key: true,
             alter_primary_key: true,
             ..base
         },
@@ -242,6 +292,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             drop_index: true,
             rebuild_index: true,
             index_type: true,
+            add_primary_key: true,
             alter_primary_key: true,
             ..base
         },
@@ -270,6 +321,7 @@ pub(super) fn capabilities_for(database_type: Option<DatabaseType>) -> TableStru
             drop_index: true,
             rebuild_index: true,
             index_type: true,
+            add_primary_key: true,
             foreign_key: true,
             ..base
         },
@@ -362,6 +414,7 @@ pub(super) fn dialect_label(dialect: StructureDialect) -> String {
         StructureDialect::ClickHouse => "clickhouse",
         StructureDialect::ManticoreSearch => "manticoresearch",
         StructureDialect::Informix => "informix",
+        StructureDialect::GaussdbM => "gaussdb-m",
         StructureDialect::Questdb => "questdb",
         StructureDialect::Unsupported => "this database",
     }
@@ -385,6 +438,7 @@ pub(super) fn database_type_for_dialect(dialect: StructureDialect) -> Option<Dat
         StructureDialect::ManticoreSearch => Some(DatabaseType::ManticoreSearch),
         StructureDialect::Informix => Some(DatabaseType::Informix),
         StructureDialect::Questdb => Some(DatabaseType::Questdb),
+        StructureDialect::GaussdbM => Some(DatabaseType::Mysql),
         StructureDialect::Unsupported => None,
     }
 }

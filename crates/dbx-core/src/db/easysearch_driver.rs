@@ -44,6 +44,12 @@ pub async fn list_indices(client: &EasysearchClient) -> Result<Vec<String>, Stri
     elasticsearch_driver::list_indices(&client.inner).await.map_err(easysearch_error)
 }
 
+pub async fn list_indices_with_aliases(
+    client: &EasysearchClient,
+) -> Result<Vec<elasticsearch_driver::ElasticsearchIndexEntry>, String> {
+    elasticsearch_driver::list_indices_with_aliases(&client.inner).await.map_err(easysearch_error)
+}
+
 pub async fn get_columns(client: &EasysearchClient, index: &str) -> Result<Vec<ColumnInfo>, String> {
     elasticsearch_driver::get_columns(&client.inner, index).await.map_err(easysearch_error)
 }
@@ -61,8 +67,44 @@ pub async fn find_documents(
         .map_err(easysearch_error)
 }
 
+pub async fn find_documents_with_cursor(
+    client: &EasysearchClient,
+    index: &str,
+    limit: i64,
+    filter: Option<&str>,
+    sort: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<DocumentQueryResult, String> {
+    elasticsearch_driver::find_documents_with_cursor(&client.inner, index, limit, filter, sort, cursor)
+        .await
+        .map_err(easysearch_error)
+}
+
+pub async fn close_cursor(client: &EasysearchClient, cursor: &str) -> Result<(), String> {
+    elasticsearch_driver::close_cursor(&client.inner, cursor).await.map_err(easysearch_error)
+}
+
 pub async fn count_documents(client: &EasysearchClient, index: &str, filter: Option<&str>) -> Result<u64, String> {
     elasticsearch_driver::count_documents(&client.inner, index, filter).await.map_err(easysearch_error)
+}
+
+pub async fn get_index_mapping(client: &EasysearchClient, index: &str) -> Result<Value, String> {
+    elasticsearch_driver::get_index_mapping(&client.inner, index).await.map_err(easysearch_error)
+}
+
+pub async fn get_index_settings(client: &EasysearchClient, index: &str) -> Result<Value, String> {
+    elasticsearch_driver::get_index_settings(&client.inner, index).await.map_err(easysearch_error)
+}
+
+pub async fn get_index_stats(client: &EasysearchClient, index: &str) -> Result<Value, String> {
+    elasticsearch_driver::get_index_stats(&client.inner, index).await.map_err(easysearch_error)
+}
+
+pub async fn delete_all_documents(
+    client: &EasysearchClient,
+    index: &str,
+) -> Result<elasticsearch_driver::ElasticsearchDeleteByQueryResult, String> {
+    elasticsearch_driver::delete_all_documents(&client.inner, index).await.map_err(easysearch_error)
 }
 
 pub async fn insert_document(
@@ -97,7 +139,17 @@ pub async fn delete_document(
 }
 
 pub async fn execute_rest_query(client: &EasysearchClient, input: &str) -> Result<QueryResult, String> {
-    elasticsearch_driver::execute_rest_query_with_sql_parser(&client.inner, input, parse_sql_response)
+    elasticsearch_driver::execute_rest_query_with_sql_parser(&client.inner, input, parse_sql_response, None)
+        .await
+        .map_err(easysearch_error)
+}
+
+pub async fn execute_rest_query_with_cursor(
+    client: &EasysearchClient,
+    input: &str,
+    cursor: Option<&str>,
+) -> Result<QueryResult, String> {
+    elasticsearch_driver::execute_rest_query_with_sql_parser(&client.inner, input, parse_sql_response, cursor)
         .await
         .map_err(easysearch_error)
 }

@@ -1,3 +1,6 @@
+import type { DatabaseType } from "@/types/database";
+import { DBX_ROWID_COLUMN } from "@/lib/table/tableEditing";
+
 // Binary column types that should not be edited inline
 export const BINARY_TYPES = new Set(["blob", "clob", "bytea", "varbinary", "binary", "image", "longblob", "mediumblob", "tinyblob", "blob sub_type 2004", "blob sub_type 2005"]);
 
@@ -23,6 +26,7 @@ export interface EditableQueryInfo {
   editableSourceKey?: string;
   multiSource?: boolean;
   allowInsert?: boolean;
+  allowDelete?: boolean;
   allowInsertDelete?: boolean;
   distinct?: boolean;
   groupByColumns?: EditableQueryColumn[];
@@ -451,8 +455,17 @@ function parseSelectColumn(col: string, sources?: EditableQuerySource[]): Editab
 
 function parseStarSelectColumn(col: string, sources?: EditableQuerySource[]): EditableQueryColumn | null {
   if (col === "*") {
+    // An unqualified `*` is unambiguous when the query has exactly one
+    // source, so it can bind to that source like a qualified `alias.*`
+    // would. Without this, expandProjectionColumnsForSources cannot find a
+    // matching table source (no sourceKey) and drops the star expansion
+    // entirely, misaligning every result column that follows it — e.g.
+    // `SELECT *, amount FROM orders` loses all result-column comments even
+    // though the table has no ambiguity to resolve.
+    const sourceKey = sources?.length === 1 ? sources[0]!.key : undefined;
     return {
       star: true,
+      ...(sourceKey ? { sourceKey } : {}),
       resultName: "*",
       expression: col,
     };
@@ -603,7 +616,7 @@ function isSelectStar(body: string, alias: string | undefined): boolean {
 }
 
 function parseFromSources(body: string): EditableQuerySource[] {
-  if (!body || /[()]/.test(body)) return [];
+  if (!body) return [];
   const sources: EditableQuerySource[] = [];
   let pos = 0;
   const first = parseTableSourceAt(body, pos, sources.length);
@@ -802,12 +815,13 @@ function escapeRegExp(value: string): string {
  * comparison prevents `id` from being mistaken for a distinct quoted `"ID"`
  * column in PostgreSQL.
  */
-export function allPrimaryKeysPresent(primaryKeys: string[], resultColumns: string[], analysis?: EditableQueryInfo, sourceKey?: string): boolean {
+export function allPrimaryKeysPresent(primaryKeys: string[], resultColumns: string[], analysis?: EditableQueryInfo, sourceKey?: string, databaseType?: DatabaseType): boolean {
   if (analysis && !analysis.selectStar) {
     const sourceColumns = new Set(
       analysis.columns.flatMap((column) => {
         if (!column.sourceName) return [];
         if (sourceKey && column.sourceKey !== sourceKey) return [];
+        if (databaseType === "oracle" && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID" && column.sourceKey === sourceKey) return [DBX_ROWID_COLUMN, column.sourceName];
         return [column.sourceName];
       }),
     );
@@ -840,12 +854,15 @@ export function allEditableColumnsWriteable(analysis: EditableQueryInfo, resultC
   return !!matchedColumns && matchedColumns.every((source) => !sourceKey || !source.sourceName || source.sourceKey === sourceKey);
 }
 
-export function sourceColumnsForResult(analysis: EditableQueryInfo, resultColumns: string[], sourceKey?: string): Array<string | undefined> | undefined {
+export function sourceColumnsForResult(analysis: EditableQueryInfo, resultColumns: string[], sourceKey?: string, databaseType?: DatabaseType, primaryKeys?: readonly string[]): Array<string | undefined> | undefined {
   if (analysis.selectStar) return undefined;
   const matchedColumns = matchColumnsForResult(analysis, resultColumns);
   if (!matchedColumns) return undefined;
   return matchedColumns.map((column) => {
     if (sourceKey && column.sourceKey !== sourceKey) return undefined;
+    if (databaseType === "oracle" && !column.sourceNameQuoted && column.sourceName?.toUpperCase() === "ROWID" && column.sourceKey === sourceKey) {
+      return primaryKeys?.length === 1 && primaryKeys[0] === DBX_ROWID_COLUMN ? DBX_ROWID_COLUMN : undefined;
+    }
     return column.sourceName;
   });
 }

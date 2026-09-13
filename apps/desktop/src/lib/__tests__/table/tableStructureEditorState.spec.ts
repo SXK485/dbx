@@ -7,6 +7,7 @@ import {
   createCopiedColumnDrafts,
   createColumnDrafts,
   createTriggerDrafts,
+  dataTypeBaseInputValue,
   dataTypeLengthInputValue,
   dataTypeLengthUnitValue,
   DATA_TYPE_OPTIONS,
@@ -50,6 +51,7 @@ describe("tableStructureEditorState", () => {
     expect(canEditStructuredTriggerDraft("oracle", existing)).toBe(false);
     expect(canEditStructuredTriggerDraft(undefined, existing)).toBe(false);
     expect(canEditStructuredTriggerDraft("mysql", existing)).toBe(true);
+    expect(canEditStructuredTriggerDraft("sqlserver", existing)).toBe(true);
     expect(
       canEditStructuredTriggerDraft("oracle", {
         id: "new:trigger",
@@ -73,6 +75,15 @@ describe("tableStructureEditorState", () => {
           is_primary_key: false,
           extra: null,
           character_maximum_length: 255,
+        },
+        {
+          name: "fixed_code",
+          data_type: "bpchar",
+          is_nullable: true,
+          column_default: null,
+          is_primary_key: false,
+          extra: null,
+          character_maximum_length: 32,
         },
         {
           name: "amount",
@@ -107,9 +118,10 @@ describe("tableStructureEditorState", () => {
       "kingbase",
     );
 
-    expect(columns.map((column) => column.dataType)).toEqual(["varchar(255)", "numeric(12,2)", "integer", "character varying(64)"]);
-    expect(columns.map((column) => column.original?.data_type)).toEqual(["varchar(255)", "numeric(12,2)", "integer", "character varying(64)"]);
+    expect(columns.map((column) => column.dataType)).toEqual(["varchar(255)", "bpchar(32)", "numeric(12,2)", "integer", "character varying(64)"]);
+    expect(columns.map((column) => column.original?.data_type)).toEqual(["varchar(255)", "bpchar(32)", "numeric(12,2)", "integer", "character varying(64)"]);
     expect(dataTypeLengthInputValue("kingbase", columns[0]?.dataType ?? "")).toBe("255");
+    expect(dataTypeLengthInputValue("kingbase", columns[1]?.dataType ?? "")).toBe("32");
   });
 
   it("turns copied metadata into new column drafts instead of existing columns", () => {
@@ -408,6 +420,55 @@ describe("tableStructureEditorState", () => {
     expect(defaultNewColumnDataType("mysql")).toBe("varchar(255)");
     expect(defaultNewColumnDataType("h2").toLowerCase()).toContain("varchar");
     expect(defaultNewColumnDataType("clickhouse")).toBe("String");
+  });
+
+  it("offers the Xugu types that can be used by the table editor", () => {
+    for (const dataType of ["TINYINT", "DOUBLE", "DATETIME", "DATETIME WITH TIME ZONE", "TIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE", "INTERVAL YEAR", "INTERVAL DAY TO SECOND", "GUID", "ROWID", "JSON", "BIT", "VARBIT", "INTEGER[]", "DOUBLE[]", "CHAR[]", "CLOB[]"]) {
+      expect(DATA_TYPE_OPTIONS.xugu).toContain(dataType);
+    }
+    for (const pseudoType of ["NULL", '"NULL"', "ARRAY", "ROWVERSION", "POINT", "LSEG", "LINE", "BOX", "PATH", "POLYGON", "CIRCLE"]) {
+      expect(DATA_TYPE_OPTIONS.xugu).not.toContain(pseudoType);
+    }
+  });
+
+  it("keeps Xugu type parameters within syntax the generic editor can emit", () => {
+    for (const fixedType of ["GUID", "ROWID", "JSON", "XML", "BLOB", "CLOB", "INTEGER[]", "INTERVAL DAY TO SECOND", "DATETIME WITH TIME ZONE"]) {
+      expect(isDataTypeLengthDisabled("xugu", fixedType)).toBe(true);
+      expect(combineDataTypeForDatabase("xugu", fixedType, "12")).toBe(fixedType);
+    }
+    for (const parameterizedType of ["VARCHAR", "BINARY", "BIT", "VARBIT", "NUMERIC", "TIME", "TIME WITH TIME ZONE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"]) {
+      expect(isDataTypeLengthDisabled("xugu", parameterizedType)).toBe(false);
+    }
+    expect(combineDataTypeForDatabase("xugu", "TIME", "3")).toBe("TIME(3)");
+    expect(combineDataTypeForDatabase("xugu", "TIME", "4")).toBe("TIME");
+    expect(combineDataTypeForDatabase("xugu", "TIMESTAMP", "6")).toBe("TIMESTAMP(6)");
+    expect(combineDataTypeForDatabase("xugu", "TIMESTAMP", "7")).toBe("TIMESTAMP");
+    expect(combineDataTypeForDatabase("xugu", "TIME WITH TIME ZONE", "3")).toBe("TIME(3) WITH TIME ZONE");
+    expect(combineDataTypeForDatabase("xugu", "TIMESTAMP WITH TIME ZONE", "6")).toBe("TIMESTAMP(6) WITH TIME ZONE");
+    expect(combineDataTypeForDatabase("xugu", "TIMESTAMP WITH TIME ZONE", "7")).toBe("TIMESTAMP WITH TIME ZONE");
+    expect(dataTypeBaseInputValue("xugu", "TIMESTAMP(6) WITH TIME ZONE")).toBe("TIMESTAMP WITH TIME ZONE");
+    expect(dataTypeLengthInputValue("xugu", "TIMESTAMP(6) WITH TIME ZONE")).toBe("6");
+
+    // Xugu-only constraints must not change other database profiles.
+    expect(isDataTypeLengthDisabled("mysql", "json")).toBe(false);
+    expect(isDataTypeLengthDisabled("oracle", "clob")).toBe(false);
+  });
+
+  it("round-trips Xugu single-parameter metadata through the editor", () => {
+    const columns = createColumnDrafts(
+      [
+        { name: "flags", data_type: "BIT", is_nullable: true, column_default: null, is_primary_key: false, extra: null, numeric_precision: 8 },
+        { name: "bits", data_type: "VARBIT", is_nullable: true, column_default: null, is_primary_key: false, extra: null, numeric_precision: 64 },
+        { name: "local_time", data_type: "TIME", is_nullable: true, column_default: null, is_primary_key: false, extra: null, numeric_precision: 3 },
+        { name: "created_at", data_type: "TIMESTAMP", is_nullable: true, column_default: null, is_primary_key: false, extra: null, numeric_precision: 6 },
+        { name: "created_at_tz", data_type: "TIMESTAMP WITH TIME ZONE", is_nullable: true, column_default: null, is_primary_key: false, extra: null, numeric_precision: 6 },
+        { name: "local_time_tz", data_type: "TIME WITH TIME ZONE", is_nullable: true, column_default: null, is_primary_key: false, extra: null, numeric_precision: 3 },
+      ],
+      "xugu",
+    );
+
+    expect(columns.map((column) => column.dataType)).toEqual(["BIT(8)", "VARBIT(64)", "TIME(3)", "TIMESTAMP(6)", "TIMESTAMP(6) WITH TIME ZONE", "TIME(3) WITH TIME ZONE"]);
+    expect(columns.map((column) => column.original?.data_type)).toEqual(columns.map((column) => column.dataType));
   });
 
   it("requires a SQLite rebuild only for a retained existing column type change", () => {

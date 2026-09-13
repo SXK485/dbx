@@ -19,6 +19,7 @@ import com.dbx.agent.TableInfo;
 import com.dbx.agent.TriggerInfo;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -218,7 +219,11 @@ public final class Db2Agent extends AbstractJdbcAgent {
     @Override
     public ObjectSource getObjectSource(String schema, String name, String objectType) {
         return unchecked(() -> {
-            String sql = "SELECT TEXT FROM SYSCAT.ROUTINES WHERE ROUTINESCHEMA = ? AND ROUTINENAME = ?";
+            String normalizedType = objectType == null ? "" : objectType.trim().toUpperCase(Locale.ROOT);
+            // View definitions live in SYSCAT.VIEWS; SYSCAT.ROUTINES only covers procedures and functions.
+            String sql = "VIEW".equals(normalizedType)
+                ? "SELECT TEXT FROM SYSCAT.VIEWS WHERE VIEWSCHEMA = ? AND VIEWNAME = ?"
+                : "SELECT TEXT FROM SYSCAT.ROUTINES WHERE ROUTINESCHEMA = ? AND ROUTINENAME = ?";
             String source;
             try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
                 stmt.setString(1, schema);
@@ -385,6 +390,10 @@ public final class Db2Agent extends AbstractJdbcAgent {
     @Override
     protected Object resultValue(ResultSet rs, int index, int sqlType) {
         return unchecked(() -> {
+            if (sqlType == Types.CLOB || sqlType == Types.NCLOB) {
+                String value = rs.getString(index);
+                return rs.wasNull() ? null : value;
+            }
             Object value = rs.getObject(index);
             return rs.wasNull() ? null : value == null ? null : value.toString();
         });

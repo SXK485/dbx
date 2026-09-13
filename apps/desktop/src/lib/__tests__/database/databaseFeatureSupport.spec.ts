@@ -3,22 +3,51 @@ import { connectionNamespaceCreationTarget, databaseNodeNamespaceCreationTarget 
 import { editableDatabasePropertyGroups, editableSchemaPropertyGroups } from "@/lib/database/databasePropertyEditing";
 import { buildGetDatabaseCommentSql } from "@/lib/database/dbAdminSql";
 import {
+  defaultAutoCommitForDbType,
   isSchemaAware,
+  supportsConnectionQueryActions,
   supportsConnectionScopedQueryExecution,
   supportsConnectionDatabaseBrowser,
   supportsDatabaseNameCompletion,
   supportsDatabaseSchemaQualifier,
+  supportsDatabaseSearch,
+  supportsObjectBrowser,
+  supportsObjectBrowserTreeNode,
+  supportsQueryExecution,
   supportsQueryTargetDatabaseListing,
   supportsQueryEditorBlockComments,
   supportsSqlInListPaste,
   supportsTableImport,
+  supportsTableVacuum,
   supportsTransaction,
   usesConnectionOnlyQueryTarget,
+  usesTreeSchemaMode,
+  schemaNodeHasLoadableName,
 } from "@/lib/database/databaseFeatureSupport";
 
 describe("schema awareness", () => {
   it("keeps SQLite database aliases separate from schema-capable databases", () => {
     expect(isSchemaAware("sqlite")).toBe(false);
+  });
+
+  it("puts Cloud Spanner in both schema sets because they gate different surfaces", () => {
+    // Spanner 2024+ has named schemas and they are queryable, so both have to be true. The two sets
+    // are not interchangeable: SCHEMA_AWARE_TYPES reaches the schema pickers in dialogs, while
+    // TREE_SCHEMA_TYPES is what makes a database node load schemas instead of tables. With only the
+    // former, `sales` showed up in the schema-diff dropdown but was unreachable in the object tree.
+    expect(isSchemaAware("spanner")).toBe(true);
+    expect(usesTreeSchemaMode("spanner")).toBe(true);
+  });
+
+  it("treats Cloud Spanner's blank schema as a loadable node name", () => {
+    // The GoogleSQL default schema node carries "", so a truthiness check would render an
+    // expandable node that never loads its tables. Other types keep the truthiness test, which is
+    // what filters the undefined schema on nodes that have no schema level at all.
+    expect(schemaNodeHasLoadableName("spanner", "")).toBe(true);
+    expect(schemaNodeHasLoadableName("spanner", "sales")).toBe(true);
+    expect(schemaNodeHasLoadableName("spanner", undefined)).toBe(false);
+    expect(schemaNodeHasLoadableName("postgres", "")).toBe(false);
+    expect(schemaNodeHasLoadableName("postgres", "public")).toBe(true);
   });
 });
 
@@ -26,6 +55,28 @@ describe("connection database browser", () => {
   it("follows object browser support without enabling unsupported connection types", () => {
     expect(supportsConnectionDatabaseBrowser("postgres")).toBe(true);
     expect(supportsConnectionDatabaseBrowser("redis")).toBe(false);
+    expect(supportsConnectionDatabaseBrowser("mongodb")).toBe(false);
+  });
+
+  it("hides the browse-databases entry for message brokers", () => {
+    // Kafka/Pulsar/RocketMQ/RabbitMQ/NATS all share db_type "mq" and differ only by
+    // driver_profile, so one exclusion covers every broker. They keep the
+    // objectBrowser capability for the tenant/topic tree, but have no database
+    // namespace, so the connection-level browser tab rendered an empty
+    // "no databases found" state (issue #8515). MQTT never had the entry.
+    expect(supportsObjectBrowser("mq")).toBe(true);
+    expect(supportsConnectionDatabaseBrowser("mq")).toBe(false);
+    expect(supportsConnectionDatabaseBrowser("mqtt")).toBe(false);
+  });
+});
+
+describe("object browser tree nodes", () => {
+  it("opens MongoDB object browser from mongo-db nodes without the SQL database list", () => {
+    expect(supportsObjectBrowser("mongodb")).toBe(true);
+    expect(supportsObjectBrowserTreeNode("mongodb", "mongo-db")).toBe(true);
+    expect(supportsObjectBrowserTreeNode("mongodb", "database")).toBe(false);
+    expect(supportsObjectBrowserTreeNode("mysql", "database")).toBe(true);
+    expect(supportsObjectBrowserTreeNode("mysql", "mongo-db")).toBe(false);
   });
 });
 
@@ -41,6 +92,47 @@ describe("connection-scoped query targets", () => {
     expect(usesConnectionOnlyQueryTarget("weaviate")).toBe(true);
     expect(usesConnectionOnlyQueryTarget("chromadb")).toBe(true);
     expect(supportsQueryTargetDatabaseListing("etcd")).toBe(false);
+  });
+});
+
+describe("connection query actions", () => {
+  it("keeps SQL query surfaces available for ordinary databases", () => {
+    expect(supportsConnectionQueryActions("mysql")).toBe(true);
+    expect(supportsConnectionQueryActions("postgres")).toBe(true);
+    expect(supportsConnectionQueryActions("redis")).toBe(true);
+    expect(supportsConnectionQueryActions(undefined)).toBe(true);
+  });
+
+  it("hides the sidebar new-query entry for specialized surfaces without a query engine", () => {
+    expect(supportsConnectionQueryActions("nacos")).toBe(false);
+    expect(supportsConnectionQueryActions("consul")).toBe(false);
+    expect(supportsConnectionQueryActions("hbase")).toBe(false);
+    expect(supportsConnectionQueryActions("zookeeper")).toBe(false);
+  });
+
+  it("hides the sidebar new-query entry for message brokers", () => {
+    // Kafka/Pulsar/RocketMQ/RabbitMQ all share db_type "mq" and have no SQL
+    // engine: the sidebar entry opened a plain SQL editor against a broker
+    // (issue #8415). MQTT has the same console-only surface.
+    expect(supportsConnectionQueryActions("mq")).toBe(false);
+    expect(supportsConnectionQueryActions("mqtt")).toBe(false);
+  });
+});
+
+describe("message queue query capabilities", () => {
+  it("does not advertise query execution for broker surfaces", () => {
+    expect(supportsQueryExecution("mq")).toBe(false);
+    expect(supportsQueryExecution("mqtt")).toBe(false);
+  });
+});
+
+describe("zookeeper query capabilities", () => {
+  it("does not advertise query execution or schema search for the kv-only agent", () => {
+    // The ZooKeeper agent exposes only kv_* operations: no list-databases or
+    // query method exists, so the manifest must not claim either capability
+    // (issue #8215: "new query" errored calling list-databases).
+    expect(supportsQueryExecution("zookeeper")).toBe(false);
+    expect(supportsDatabaseSearch("zookeeper")).toBe(false);
   });
 });
 
@@ -66,9 +158,12 @@ describe("supportsTransaction", () => {
   it("returns true for supported database types", () => {
     expect(supportsTransaction("postgres")).toBe(true);
     expect(supportsTransaction("mysql")).toBe(true);
+    expect(supportsTransaction("oracle")).toBe(true);
+    expect(supportsTransaction("jdbc")).toBe(true);
   });
 
   it("returns false for unsupported database types", () => {
+    expect(supportsTransaction("oceanbase-oracle")).toBe(false);
     expect(supportsTransaction("redis")).toBe(false);
     expect(supportsTransaction("mongodb")).toBe(false);
     expect(supportsTransaction("duckdb")).toBe(false);
@@ -78,7 +173,6 @@ describe("supportsTransaction", () => {
     expect(supportsTransaction("sqlite")).toBe(false);
     expect(supportsTransaction("clickhouse")).toBe(false);
     expect(supportsTransaction("sqlserver")).toBe(false);
-    expect(supportsTransaction("oracle")).toBe(false);
     expect(supportsTransaction("dameng")).toBe(false);
     expect(supportsTransaction("rqlite")).toBe(false);
     expect(supportsTransaction("agent")).toBe(false);
@@ -86,6 +180,36 @@ describe("supportsTransaction", () => {
 
   it("returns false for undefined or empty input", () => {
     expect(supportsTransaction(undefined)).toBe(false);
+  });
+});
+
+describe("defaultAutoCommitForDbType", () => {
+  it("defaults query tabs to auto-commit unless the user configured manual", () => {
+    expect(defaultAutoCommitForDbType("oceanbase-oracle")).toBe(true);
+    expect(defaultAutoCommitForDbType("oracle")).toBe(true);
+    expect(defaultAutoCommitForDbType("mysql")).toBe(true);
+    expect(defaultAutoCommitForDbType("postgres")).toBe(true);
+    expect(defaultAutoCommitForDbType("dameng")).toBe(true);
+    expect(defaultAutoCommitForDbType(undefined)).toBe(true);
+  });
+
+  it("honors the configured default transaction mode", () => {
+    expect(defaultAutoCommitForDbType("mysql", "manual")).toBe(false);
+    expect(defaultAutoCommitForDbType("postgres", "manual")).toBe(false);
+    expect(defaultAutoCommitForDbType("oracle", "manual")).toBe(false);
+    expect(defaultAutoCommitForDbType("jdbc", "manual")).toBe(false);
+    expect(defaultAutoCommitForDbType("mysql", "auto")).toBe(true);
+    expect(defaultAutoCommitForDbType(undefined, "auto")).toBe(true);
+  });
+
+  it("keeps non-transaction databases auto-commit even when manual is configured", () => {
+    expect(defaultAutoCommitForDbType("redis", "manual")).toBe(true);
+    expect(defaultAutoCommitForDbType("mongodb", "manual")).toBe(true);
+    expect(defaultAutoCommitForDbType("sqlite", "manual")).toBe(true);
+    expect(defaultAutoCommitForDbType("dameng", "manual")).toBe(true);
+    expect(defaultAutoCommitForDbType("clickhouse", "manual")).toBe(true);
+    expect(defaultAutoCommitForDbType("oceanbase-oracle", "manual")).toBe(true);
+    expect(defaultAutoCommitForDbType(undefined, "manual")).toBe(true);
   });
 });
 
@@ -136,6 +260,20 @@ describe("supportsQueryEditorBlockComments", () => {
     expect(supportsQueryEditorBlockComments("redis")).toBe(false);
     expect(supportsQueryEditorBlockComments("mongodb")).toBe(false);
     expect(supportsQueryEditorBlockComments("elasticsearch")).toBe(false);
+  });
+});
+
+describe("supportsTableVacuum", () => {
+  it("enables VACUUM for the supported PostgreSQL family", () => {
+    for (const databaseType of ["postgres", "gaussdb", "opengauss", "kingbase", "vastbase", "highgo", "uxdb", "kwdb"] as const) {
+      expect(supportsTableVacuum(databaseType)).toBe(true);
+    }
+  });
+
+  it("does not enable VACUUM for unrelated database types", () => {
+    for (const databaseType of ["mysql", "sqlite", "redshift", "oracle", "jdbc"] as const) {
+      expect(supportsTableVacuum(databaseType)).toBe(false);
+    }
   });
 });
 

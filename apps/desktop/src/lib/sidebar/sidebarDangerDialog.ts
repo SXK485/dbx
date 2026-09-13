@@ -4,6 +4,8 @@ export interface SidebarDangerDialogOption {
   checked: boolean;
   label: string;
   hint: string;
+  compact?: boolean;
+  danger?: boolean;
   onChange?: (checked: boolean) => void | Promise<void>;
 }
 
@@ -29,9 +31,13 @@ export interface SidebarDangerDialogRequest {
   details?: string;
   detailsText?: string;
   loading?: boolean;
+  /** Keeps the confirm button held back until the request's own precondition is met (e.g. a typed target name). */
+  confirmDisabled?: boolean;
   closeOnConfirm?: boolean;
   progress?: SidebarDangerDialogProgress;
   option?: SidebarDangerDialogOption;
+  options?: SidebarDangerDialogOption[];
   textInput?: SidebarDangerDialogTextInput;
-  confirm: () => void | Promise<void>;
+  cancelRunning?: () => void | Promise<void>;
+  confirm: () => void | boolean | Promise<void | boolean>;
 }

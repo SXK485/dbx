@@ -172,6 +172,7 @@ test('uses the approved CNB mirror images and matching recipe versions', () => {
     'clickhouse@24.8': { version: '24.8.14.39', image: 'docker.cnb.cool/znb/images/clickhouse-server:24.8.14.39', platforms: ['linux/amd64', 'linux/arm64'] },
     'consul@2.0.2': { version: '2.0.2', image: 'docker.cnb.cool/znb/images/consul:2.0.2', platforms: ['linux/amd64', 'linux/arm64'] },
     'elasticsearch@6.8': { version: '6.8', image: 'docker.cnb.cool/znb/images/elasticsearch:6.8', platforms: ['linux/amd64', 'linux/arm64'] },
+    'etcd@3.5': { version: '3.5.21', image: 'quay.io/coreos/etcd:v3.5.21', platforms: ['linux/amd64', 'linux/arm64'] },
     'etcd@3.7': { version: '3.7.0', image: 'docker.cnb.cool/znb/images/etcd:v3.7.0', platforms: ['linux/amd64', 'linux/arm64'] },
     'kafka@4.3': { version: '4.3.1', image: 'docker.cnb.cool/znb/images/kafka:4.3.1', platforms: ['linux/amd64', 'linux/arm64'] },
     'mariadb@10.11': { version: '10.11.11', image: 'docker.cnb.cool/znb/images/mariadb:10.11.11', platforms: ['linux/amd64', 'linux/arm64'] },
@@ -207,6 +208,16 @@ test('initializes both Nacos versions with the shared administrator credentials'
     assert.doesNotMatch(compose, /tail -f \/dev\/null/);
     assert.deepEqual(validateRecipe(recipe), []);
   }
+});
+
+test('verifies Nacos 2.5 rejects unauthenticated configuration reads', () => {
+  const recipe = discoverRecipes().find((item) => recipeSelector(item) === 'nacos@2.5');
+  const authenticationStep = recipe.smoke.steps.find((step) => step.name === 'reject unauthenticated configuration reads');
+
+  assert.ok(authenticationStep);
+  assert.match(authenticationStep.command.join(' '), /nacos\/v1\/cs\/configs/);
+  assert.match(authenticationStep.command.join(' '), /403/);
+  assert.equal(authenticationStep.expect, 'unauthenticated access rejected');
 });
 
 test('configures r-nacos with its admin account and console port', () => {

@@ -24,6 +24,7 @@ pub mod elasticsearch_sql;
 pub mod file_validator;
 pub mod hbase_driver;
 pub mod http_tunnel;
+pub mod influxdb3_driver;
 pub mod influxdb_driver;
 pub mod manticoresearch;
 pub mod meilisearch_driver;
@@ -39,6 +40,7 @@ pub mod questdb;
 pub mod redis_driver;
 pub mod rqlite_driver;
 pub mod sqlite;
+pub mod sqlite_worker;
 pub mod sqlserver;
 pub mod ssh_host_key;
 pub mod ssh_prompt;
@@ -58,6 +60,7 @@ use std::future::Future;
 use std::time::Duration;
 
 // Re-export types so that `db::QueryResult` etc. work within dbx-core
+pub use crate::mysql_event_sql::MysqlEventInfo;
 pub use crate::types::*;
 pub use file_validator::validate_file_path;
 
@@ -128,7 +131,7 @@ pub fn http_client_builder(timeout: Duration) -> ClientBuilder {
     reqwest::Client::builder().connect_timeout(timeout).no_proxy()
 }
 
-const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+pub(crate) const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 pub fn safe_i64_to_json(v: i64) -> serde_json::Value {
     if !(-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {

@@ -58,7 +58,7 @@ export interface DataGridCopyInsertStatementOptions {
   insertMode?: DataGridCopyInsertMode;
 }
 
-export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "less-than-or-equal" | "greater-than" | "greater-than-or-equal" | "in" | "not-in" | "between" | "not-between";
+export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "is-blank" | "is-not-blank" | "like" | "not-like" | "begins-with" | "ends-with" | "less-than" | "less-than-or-equal" | "greater-than" | "greater-than-or-equal" | "in" | "not-in" | "between" | "not-between";
 
 export interface DataGridContextFilterConditionOptions {
   databaseType?: DatabaseType;
@@ -89,6 +89,7 @@ export interface DataGridColumnValuesFilterConditionOptions {
 
 export interface DataGridColumnDistinctValuesSqlOptions {
   databaseType?: DatabaseType;
+  driverProfile?: string;
   identifierQuote?: string;
   catalog?: string;
   database?: string;
@@ -113,6 +114,15 @@ export interface DataGridCountSqlOptions {
   /** Optional optimizer hint injected between SELECT and the select list.
    *  Example: "/*+ set(query_dop 32) *​/" for GaussDB parallel COUNT(*). */
   countHint?: string;
+}
+
+export interface DataGridConditionalUpdateSqlOptions {
+  databaseType?: DatabaseType;
+  identifierQuote?: string;
+  tableMeta: DataGridTableMeta;
+  columnName: string;
+  value: GridCellValue;
+  whereInput: string;
 }
 
 export interface HiveTablePropertiesSqlOptions {
@@ -149,13 +159,17 @@ export function buildDataGridCountSql(options: DataGridCountSqlOptions): Promise
   return api.buildDataGridCountSql(options);
 }
 
+export function buildDataGridConditionalUpdateSql(options: DataGridConditionalUpdateSqlOptions): Promise<string | undefined> {
+  return api.buildDataGridConditionalUpdateSql(options);
+}
+
 export function buildHiveTablePropertiesSql(options: HiveTablePropertiesSqlOptions): Promise<string> {
   return api.buildHiveTablePropertiesSql(options);
 }
 
 export function normalizeDataGridSaveError(databaseType: DatabaseType | undefined, error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  if (databaseType === "hive" && /Attempt to do update or delete|Error 10294/i.test(message)) {
+  if ((databaseType === "hive" || databaseType === "argo") && /Attempt to do update or delete|Error 10294/i.test(message)) {
     return "Hive UPDATE/DELETE are not enabled for this table or server. Add rows with INSERT, or enable ACID transactional tables in Hive before editing/deleting existing rows.";
   }
   return message;

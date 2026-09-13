@@ -4,12 +4,18 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
-use dbx_core::connection::{connection_configs_pool_equivalent, AppState, PoolKind};
+use dbx_core::connection::{
+    connection_configs_pool_equivalent, connection_configs_session_credentials_compatible, AppState, PoolKind,
+};
 use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType};
+use dbx_core::nacos::config::{
+    take_transient_passwords, NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD,
+};
 use dbx_core::runtime_config::{
     release_runtime_config_on_disconnect, should_retain_runtime_config, TEST_PROBE_ID_PREFIX,
 };
-use serde::Deserialize;
+use dbx_core::session_credentials::{PurposeSessionCredentialWriteToken, SessionCredentialWriteToken};
+use serde::{Deserialize, Serialize};
 
 use crate::auth::session_token_from_headers;
 use crate::error::AppError;
@@ -17,6 +23,74 @@ use crate::state::WebState;
 
 const MONGO_LEGACY_DRIVER_PROFILE: &str = "mongodb-legacy";
 const MONGO_LEGACY_DRIVER_LABEL: &str = "MongoDB (Legacy)";
+
+#[derive(Default)]
+struct NoSaveRuntimeSecrets {
+    primary: Option<String>,
+    console: Option<String>,
+}
+
+#[derive(Default)]
+struct SessionCredentialWrites {
+    primary: Option<SessionCredentialWriteToken>,
+    purposes: Vec<PurposeSessionCredentialWriteToken>,
+}
+
+fn prepare_runtime_config(mut config: ConnectionConfig) -> (ConnectionConfig, NoSaveRuntimeSecrets) {
+    if config.save_password {
+        return (config, NoSaveRuntimeSecrets::default());
+    }
+    if config.db_type == DatabaseType::Nacos {
+        let passwords = take_transient_passwords(&mut config);
+        return (config, NoSaveRuntimeSecrets { primary: passwords.primary, console: passwords.console });
+    }
+    let primary = std::mem::take(&mut config.password);
+    (config, NoSaveRuntimeSecrets { primary: (!primary.is_empty()).then_some(primary), console: None })
+}
+
+fn record_session_credentials(
+    app: &AppState,
+    owner: &str,
+    connection_id: &str,
+    secrets: &NoSaveRuntimeSecrets,
+    nacos: bool,
+) -> SessionCredentialWrites {
+    let primary =
+        secrets.primary.as_deref().and_then(|password| app.session_credentials.set(owner, connection_id, password));
+    let mut purposes = Vec::new();
+    if nacos {
+        if let Some(token) = secrets.primary.as_deref().and_then(|password| {
+            app.session_credentials.set_for_purpose_with_token(
+                owner,
+                connection_id,
+                NACOS_PRIMARY_SESSION_PASSWORD,
+                password,
+            )
+        }) {
+            purposes.push(token);
+        }
+        if let Some(token) = secrets.console.as_deref().and_then(|password| {
+            app.session_credentials.set_for_purpose_with_token(
+                owner,
+                connection_id,
+                NACOS_CONSOLE_SESSION_PASSWORD,
+                password,
+            )
+        }) {
+            purposes.push(token);
+        }
+    }
+    SessionCredentialWrites { primary, purposes }
+}
+
+fn rollback_session_credential_writes(app: &AppState, writes: &SessionCredentialWrites) {
+    for token in &writes.purposes {
+        app.session_credentials.remove_purpose_if_current(token);
+    }
+    if let Some(token) = writes.primary.as_ref() {
+        app.session_credentials.remove_if_current(token);
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +121,14 @@ pub struct SessionCredentialStatusRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReplaceNacosSessionCredentialRequest {
+    pub connection_id: String,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectionIdentifierQuoteRequest {
     pub connection_id: String,
     pub database: Option<String>,
@@ -57,6 +139,19 @@ pub struct ConnectionIdentifierQuoteRequest {
 pub struct SaveConnectionDatabaseInfoRequest {
     pub connection_id: String,
     pub database_info: Option<DatabaseConnectionInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlockConnectionWritesRequest {
+    pub connection_id: String,
+    pub duration_secs: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteUnlockStateResponse {
+    pub remaining_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -161,10 +256,7 @@ async fn sync_mongo_legacy_driver_fallback(state: &WebState, config: &Connection
     if config.db_type != DatabaseType::MongoDb {
         return Ok(());
     }
-    let uses_legacy_agent = {
-        let connections = state.app.connections.read().await;
-        matches!(connections.get(&config.id), Some(PoolKind::Agent(_)))
-    };
+    let uses_legacy_agent = matches!(state.app.pool_handle(&config.id).await, Some(PoolKind::Agent(_)));
     if !uses_legacy_agent {
         return Ok(());
     }
@@ -178,11 +270,15 @@ async fn run_temporary_connection_test(
 ) -> Result<ConnectionTestResult, String> {
     let temp_id = format!("{TEST_PROBE_ID_PREFIX}{}", uuid::Uuid::new_v4());
     app.configs.write().await.insert(temp_id.clone(), config.clone());
+    let mut nacos_database_info = None;
 
     let pool_result = if config.db_type == DatabaseType::Nacos {
         match app.nacos_admin_config_for_connection(&temp_id, &config).await {
             Ok(admin_config) => match app.nacos_registry.build_transient_config(admin_config).await {
-                Ok(adapter) => adapter.test_connection_with_scope_validation().await.map(|_| temp_id.clone()),
+                Ok(adapter) => adapter.test_connection_with_scope_validation().await.map(|info| {
+                    nacos_database_info = dbx_core::nacos::service::database_info_from_connection(&info);
+                    temp_id.clone()
+                }),
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
@@ -190,7 +286,9 @@ async fn run_temporary_connection_test(
     } else {
         app.get_or_create_pool(&temp_id, config.database.as_deref()).await
     };
-    let database_info = if include_database_info && config.db_type != DatabaseType::Nacos {
+    let database_info = if include_database_info && config.db_type == DatabaseType::Nacos {
+        nacos_database_info
+    } else if include_database_info {
         match &pool_result {
             Ok(_) => match app.connection_database_info(&temp_id, config.database.as_deref()).await {
                 Ok(info) => info,
@@ -213,12 +311,9 @@ async fn run_temporary_connection_test(
     // runs before either a successful result or an error is returned.
     let result: Result<ConnectionTestResult, String> = async {
         let success_message = if pool_result.is_ok() && config.db_type == DatabaseType::Consul {
-            let client = {
-                let connections = app.connections.read().await;
-                match connections.get(&temp_id) {
-                    Some(PoolKind::Consul(client)) => Some(client.clone()),
-                    _ => None,
-                }
+            let client = match app.pool_handle(&temp_id).await {
+                Some(PoolKind::Consul(client)) => Some(client),
+                _ => None,
             };
             if let Some(client) = client {
                 let configured_target =
@@ -272,6 +367,13 @@ pub async fn test_connection_with_info(
     run_temporary_connection_test(&state.app, body.config, true).await.map(Json).map_err(AppError::from)
 }
 
+pub async fn test_ssh_tunnel(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ConnectRequest>,
+) -> Result<Json<String>, AppError> {
+    state.app.test_connection_ssh_tunnel(&body.config.canonicalized()).await.map(Json).map_err(AppError::from)
+}
+
 pub async fn connect_db(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -299,14 +401,14 @@ pub async fn connect_db(
     // 只有本次请求确实写入/替换了会话凭据（输入了非空密码）时，才需要在连接
     // 失败时回滚它；无密码重连复用的是既有有效凭据，失败不应清掉它，否则瞬时的
     // 数据库/网络抖动就会让"本次会话内记住密码"失效、下次又弹窗。
-    let session_credential_write = (!config.save_password)
-        .then(|| app.session_credentials.set(&owner, &connection_id, &config.password))
-        .flatten();
-    let no_save_password = !config.save_password;
-    let mut runtime_config = config.clone();
-    if no_save_password {
-        runtime_config.password.clear();
-    }
+    let (runtime_config, runtime_secrets) = prepare_runtime_config(config.clone());
+    let session_credential_writes = record_session_credentials(
+        app,
+        &owner,
+        &connection_id,
+        &runtime_secrets,
+        config.db_type == DatabaseType::Nacos,
+    );
 
     app.remove_connection_pools_detached(&connection_id).await;
     app.nacos_registry.drop_connection(&connection_id).await;
@@ -316,17 +418,13 @@ pub async fn connect_db(
     if let Err(error) = app.get_or_create_pool_for_connection_attempt(&connection_id, None, attempt).await {
         // 连接失败：仅回滚本次请求刚写入的会话凭据，避免前端误判"已记住密码"而用
         // 失败密码免弹窗重试；无密码重连复用的既有凭据不受瞬时失败影响。
-        if let Some(token) = session_credential_write.as_ref() {
-            app.session_credentials.remove_if_current(token);
-        }
+        rollback_session_credential_writes(app, &session_credential_writes);
         return Err(AppError::from(error));
     }
     if let Err(error) = sync_mongo_legacy_driver_fallback(&state, &config).await {
         app.remove_connection_pools_detached(&connection_id).await;
         app.reset_connection_transport_for_config(&connection_id, &config).await;
-        if let Some(token) = session_credential_write.as_ref() {
-            app.session_credentials.remove_if_current(token);
-        }
+        rollback_session_credential_writes(app, &session_credential_writes);
         return Err(error);
     }
 
@@ -357,6 +455,35 @@ pub async fn save_connection_database_info(
         .map_err(AppError::from)
 }
 
+pub async fn unlock_connection_writes(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<UnlockConnectionWritesRequest>,
+) -> Result<Json<WriteUnlockStateResponse>, AppError> {
+    if !state.app.configs.read().await.contains_key(&body.connection_id) {
+        return Err(AppError::from("Connection not found".to_string()));
+    }
+    let remaining_ms =
+        state.app.write_unlock_windows.unlock(&body.connection_id, body.duration_secs).await.map_err(AppError::from)?;
+    Ok(Json(WriteUnlockStateResponse { remaining_ms }))
+}
+
+pub async fn lock_connection_writes(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ConnectionIdentifierQuoteRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.write_unlock_windows.lock(&body.connection_id).await;
+    Ok(Json(()))
+}
+
+pub async fn connection_write_unlock_state(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ConnectionIdentifierQuoteRequest>,
+) -> Result<Json<WriteUnlockStateResponse>, AppError> {
+    Ok(Json(WriteUnlockStateResponse {
+        remaining_ms: state.app.write_unlock_windows.remaining_ms(&body.connection_id).await,
+    }))
+}
+
 pub async fn connection_final_proxy_port(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -380,17 +507,18 @@ pub async fn connection_final_proxy_port(
     let db_config = dbx_core::connection::metadata_connection_config(&runtime_config);
     // Tunnel resolution needs a runtime config lookup, but a no-save password
     // must never enter the shared Web config cache and bypass owner isolation.
-    let mut stored_config = runtime_config.clone();
-    if !stored_config.save_password {
-        stored_config.password.clear();
-    }
+    let (stored_config, runtime_secrets) = prepare_runtime_config(runtime_config.clone());
     app.configs.write().await.insert(connection_id.clone(), stored_config);
 
     let (_, port) = app.connection_host_port(&connection_id, &db_config).await.map_err(AppError::from)?;
-    if !runtime_config.save_password && !runtime_config.password.is_empty() {
-        let owner = session_token_from_headers(&headers).unwrap_or_default();
-        let _ = app.session_credentials.set(&owner, &connection_id, &runtime_config.password);
-    }
+    let owner = session_token_from_headers(&headers).unwrap_or_default();
+    record_session_credentials(
+        app,
+        &owner,
+        &connection_id,
+        &runtime_secrets,
+        runtime_config.db_type == DatabaseType::Nacos,
+    );
     Ok(Json(port))
 }
 
@@ -458,6 +586,20 @@ pub async fn forget_session_credential(
     Ok(Json(()))
 }
 
+pub async fn replace_nacos_session_credential(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(body): Json<ReplaceNacosSessionCredentialRequest>,
+) -> Result<Json<()>, AppError> {
+    let owner = session_token_from_headers(&headers).unwrap_or_default();
+    state
+        .app
+        .replace_nacos_session_credential(&owner, &body.connection_id, &body.username, &body.password)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
 pub async fn connection_identifier_quote(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectionIdentifierQuoteRequest>,
@@ -481,7 +623,7 @@ pub async fn close_database_connection(
 
 pub async fn save_connections(
     State(state): State<Arc<WebState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<SaveConnectionsRequest>,
 ) -> Result<Json<()>, AppError> {
     for config in &body.configs {
@@ -495,7 +637,13 @@ pub async fn save_connections(
         }
     }
     state.app.storage.save_connections(&body.configs).await.map_err(AppError::from)?;
-    let sync = sync_connection_configs(&state, &body.configs).await;
+    let owner = session_token_from_headers(&headers).unwrap_or_default();
+    let runtime_configs = body.configs.iter().cloned().map(prepare_runtime_config).collect::<Vec<_>>();
+    let sanitized_configs = runtime_configs.iter().map(|(config, _)| config.clone()).collect::<Vec<_>>();
+    let sync = sync_connection_configs(&state, &sanitized_configs).await;
+    for (config, secrets) in &runtime_configs {
+        record_session_credentials(&state.app, &owner, &config.id, secrets, config.db_type == DatabaseType::Nacos);
+    }
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
@@ -601,12 +749,14 @@ async fn sync_connection_configs(state: &WebState, configs: &[ConnectionConfig])
             if previous.db_type == dbx_core::models::connection::DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(config.id.clone());
             }
+            if !connection_configs_session_credentials_compatible(&previous, config) {
+                // 全局端点或认证身份变化时清除所有 owner 的旧凭据；显示范围等
+                // 本地设置不改变凭据归属，必须保留各 owner 的 no-save 密码。
+                state.app.session_credentials.clear_connection(&config.id);
+            }
             // 仅在真实连接参数变化时销毁池；save_password=false 连接因持久化
             // 空密码与运行态密码产生的差异被忽略（见 connection_configs_pool_equivalent）。
             if !connection_configs_pool_equivalent(&previous, config) {
-                // 连接端点/认证参数已全局变化：清除所有 owner 的旧凭据与池 owner，
-                // 避免其他登录会话把旧密码或旧池复用到新的连接定义。
-                state.app.session_credentials.clear_connection(&config.id);
                 connection_pool_ids_to_drop.insert(config.id.clone());
             }
         }
@@ -659,6 +809,9 @@ mod tests {
         AttachedDatabaseConfig, ConnectionConfig, DatabaseConnectionInfo, DatabaseType, ProxyTunnelConfig, ProxyType,
         TransportLayerConfig,
     };
+    use dbx_core::nacos::config::{
+        NacosAuthConfig, NacosRNacosConsoleAuth, NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD,
+    };
     use dbx_core::storage::{McpGlobalPolicy, Storage};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -683,6 +836,7 @@ mod tests {
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -710,10 +864,16 @@ mod tests {
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -734,6 +894,36 @@ mod tests {
             "adminUrl": admin_url,
             "auth": { "kind": "none" },
             "pinnedVersion": "3.1"
+        }));
+        config
+    }
+
+    fn nacos_config(id: &str) -> ConnectionConfig {
+        let mut config = sqlite_config(id, "");
+        config.name = "Nacos".to_string();
+        config.db_type = DatabaseType::Nacos;
+        config.host = "127.0.0.1".to_string();
+        config.port = 8848;
+        config.username = "ordinary-user".to_string();
+        config.save_password = false;
+        config.visible_databases = Some(vec!["namespace-a".to_string()]);
+        config.external_config = Some(serde_json::json!({
+            "implementation": "nacos",
+            "versionMode": "v3",
+            "apiPlane": "admin",
+            "serverAddr": "http://127.0.0.1:8848",
+            "managedNamespaces": ["namespace-a"],
+            "rnacosConsoleAddr": "http://127.0.0.1:10848",
+            "rnacosConsoleAuth": {
+                "kind": "usernamePassword",
+                "username": "console-user",
+                "password": "console-password"
+            },
+            "auth": {
+                "kind": "usernamePassword",
+                "username": "ordinary-user",
+                "password": "old-password"
+            }
         }));
         config
     }
@@ -850,7 +1040,7 @@ mod tests {
         assert_eq!(detailed.0.message, "Connection successful");
         assert_eq!(detailed.0.database_info, None);
         assert!(state.app.configs.read().await.keys().all(|key| !key.starts_with("__test_")));
-        assert!(state.app.connections.read().await.keys().all(|key| !key.starts_with("__test_")));
+        assert!(state.app.with_connection_pools(|pools| pools.keys().all(|key| !key.starts_with("__test_"))).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -865,7 +1055,7 @@ mod tests {
 
         assert!(error.contains("CONSUL_AGENT_TARGET_MISMATCH"), "unexpected error: {error}");
         assert!(state.app.configs.read().await.keys().all(|key| !key.starts_with("__test_")));
-        assert!(state.app.connections.read().await.keys().all(|key| !key.starts_with("__test_")));
+        assert!(state.app.with_connection_pools(|pools| pools.keys().all(|key| !key.starts_with("__test_"))).await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -913,7 +1103,7 @@ mod tests {
         assert_eq!(result.0, "Connection successful");
 
         assert!(state.app.configs.read().await.keys().all(|key| !key.starts_with("__test_")));
-        assert!(state.app.connections.read().await.keys().all(|key| !key.starts_with("__test_")));
+        assert!(state.app.with_connection_pools(|pools| pools.keys().all(|key| !key.starts_with("__test_"))).await);
         let cached = state.app.mq_registry.cached_connection_ids().await;
         assert!(
             cached.iter().all(|id| !id.starts_with("__test_")),
@@ -936,7 +1126,12 @@ mod tests {
         .await
         .unwrap();
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::Sqlite(pool.clone()));
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert(initial.id.clone(), PoolKind::Sqlite(pool.clone()));
+            })
+            .await;
 
         let mut invalid = initial.clone();
         invalid.attached_databases.push(AttachedDatabaseConfig {
@@ -973,7 +1168,7 @@ mod tests {
         .unwrap_err();
         assert!(proxy_error.message.contains("in-memory main database"), "{}", proxy_error.message);
 
-        assert!(state.app.connections.read().await.contains_key(&initial.id));
+        assert!(state.app.pool_handle(&initial.id).await.is_some());
         assert_eq!(state.app.configs.read().await.get(&initial.id), Some(&initial));
         let retained = dbx_core::db::sqlite::execute_query(&pool, "SELECT value FROM retained;").await.unwrap();
         assert_eq!(retained.rows[0][0], serde_json::json!("yes"));
@@ -1044,6 +1239,7 @@ mod tests {
                 read_only: false,
                 allow_dangerous_sql: false,
                 allowed_connection_ids: Some(vec![existing.id.clone()]),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1116,6 +1312,7 @@ mod tests {
                 read_only: false,
                 allow_dangerous_sql: false,
                 allowed_connection_ids: Some(vec![removed.id.clone()]),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1146,6 +1343,7 @@ mod tests {
                 read_only: true,
                 allow_dangerous_sql: false,
                 allowed_connection_ids: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1166,7 +1364,12 @@ mod tests {
         let config = mq_config("mq-info", "http://127.0.0.1:8080");
         state.app.storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
         state.app.configs.write().await.insert(config.id.clone(), config.clone());
-        state.app.connections.write().await.insert(config.id.clone(), PoolKind::MessageQueue);
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert(config.id.clone(), PoolKind::MessageQueue);
+            })
+            .await;
         let database_info = DatabaseConnectionInfo {
             product_name: Some("Apache Pulsar".to_string()),
             product_version: Some("3.3.0".to_string()),
@@ -1183,7 +1386,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(state.app.connections.read().await.contains_key(&config.id));
+        assert!(state.app.pool_handle(&config.id).await.is_some());
         assert_eq!(state.app.configs.read().await[&config.id].database_info, Some(database_info.clone()));
         assert_eq!(state.app.storage.load_connections().await.unwrap()[0].database_info, Some(database_info));
 
@@ -1196,7 +1399,12 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert(initial.id.clone(), PoolKind::MessageQueue);
+            })
+            .await;
         let first = state.app.mq_registry.get_or_build(&initial).await.unwrap().adapter;
 
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
@@ -1222,7 +1430,7 @@ mod tests {
 
         let second = state.app.mq_registry.get_or_build(&updated).await.unwrap().adapter;
         assert!(!Arc::ptr_eq(&first, &second));
-        assert!(!state.app.connections.read().await.contains_key(&initial.id));
+        assert!(state.app.pool_handle(&initial.id).await.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1233,7 +1441,12 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert(initial.id.clone(), PoolKind::MessageQueue);
+            })
+            .await;
         let first = state.app.mq_registry.get_or_build(&initial).await.unwrap().adapter;
 
         let updated = mq_config("mq-conn", &spawn_pulsar_clusters_server().await);
@@ -1314,6 +1527,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_connections_scopes_all_nacos_no_save_passwords_to_the_request_owner() {
+        let (state, dir) = test_web_state().await;
+        let config = nacos_config("nacos-a");
+        let headers_a = cookie_headers("token-a");
+
+        let _ =
+            save_connections(State(state.clone()), headers_a, Json(SaveConnectionsRequest { configs: vec![config] }))
+                .await
+                .unwrap();
+
+        let runtime = state.app.configs.read().await.get("nacos-a").cloned().unwrap();
+        assert!(runtime.password.is_empty());
+        let external = runtime.external_config.as_ref().unwrap();
+        assert_eq!(external["auth"]["password"], "");
+        assert_eq!(external["rnacosConsoleAuth"]["password"], "");
+        assert_eq!(
+            state
+                .app
+                .session_credentials
+                .get_for_purpose("token-a", "nacos-a", NACOS_PRIMARY_SESSION_PASSWORD)
+                .as_deref(),
+            Some("old-password")
+        );
+        assert_eq!(
+            state
+                .app
+                .session_credentials
+                .get_for_purpose("token-a", "nacos-a", NACOS_CONSOLE_SESSION_PASSWORD)
+                .as_deref(),
+            Some("console-password")
+        );
+        assert_eq!(
+            state.app.session_credentials.get_for_purpose("token-b", "nacos-a", NACOS_PRIMARY_SESSION_PASSWORD),
+            None
+        );
+        assert_eq!(
+            state.app.session_credentials.get_for_purpose("token-b", "nacos-a", NACOS_CONSOLE_SESSION_PASSWORD),
+            None
+        );
+
+        dbx_core::session_credentials::with_credential_owner(Some("token-a".to_string()), async {
+            let parsed = state.app.nacos_admin_config_for_connection("nacos-a", &runtime).await.unwrap();
+            assert!(matches!(
+                parsed.auth,
+                NacosAuthConfig::UsernamePassword { ref password, .. } if password == "old-password"
+            ));
+            assert!(matches!(
+                parsed.rnacos_console_auth,
+                NacosRNacosConsoleAuth::UsernamePassword { ref password, .. } if password == "console-password"
+            ));
+        })
+        .await;
+        dbx_core::session_credentials::with_credential_owner(Some("token-b".to_string()), async {
+            let parsed = state.app.nacos_admin_config_for_connection("nacos-a", &runtime).await.unwrap();
+            assert!(matches!(
+                parsed.auth,
+                NacosAuthConfig::UsernamePassword { ref password, .. } if password.is_empty()
+            ));
+            assert!(matches!(
+                parsed.rnacos_console_auth,
+                NacosRNacosConsoleAuth::UsernamePassword { ref password, .. } if password.is_empty()
+            ));
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn connection_final_proxy_port_sanitizes_no_save_passwords() {
         let (state, dir) = test_web_state().await;
         let mut config = sqlite_config("conn-a", "127.0.0.1");
@@ -1386,7 +1668,12 @@ mod tests {
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
         state.app.storage.save_connections(std::slice::from_ref(&updated)).await.unwrap();
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
-        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert(initial.id.clone(), PoolKind::MessageQueue);
+            })
+            .await;
 
         let result = load_connections(State(state.clone()), HeaderMap::new()).await;
         assert!(result.is_ok());
@@ -1399,7 +1686,7 @@ mod tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(cached_admin_url, Some("http://127.0.0.1:8081"));
         drop(configs);
-        assert!(!state.app.connections.read().await.contains_key(&initial.id));
+        assert!(state.app.pool_handle(&initial.id).await.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1452,6 +1739,47 @@ mod tests {
         assert!(!state.app.session_credentials.has("token-b", "conn-a"));
         assert!(!state.app.session_credentials.has_pool_owner("conn-a"));
         assert!(state.app.session_credentials.pool_owner_mismatch("conn-a", "token-b"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sync_connection_configs_preserves_all_nacos_owner_passwords_for_scope_updates() {
+        let (state, dir) = test_web_state().await;
+        let initial = nacos_config("nacos-a");
+        state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
+        for (owner, password) in [("token-a", "owner-a-secret"), ("token-b", "owner-b-secret")] {
+            let _ = state.app.session_credentials.set(owner, &initial.id, password);
+            state.app.session_credentials.set_for_purpose(owner, &initial.id, "nacos-primary-password", password);
+        }
+
+        let mut scope_updated = initial.clone();
+        scope_updated.visible_databases = Some(vec!["namespace-a".to_string(), "namespace-b".to_string()]);
+        scope_updated.external_config.as_mut().unwrap()["managedNamespaces"] =
+            serde_json::json!(["namespace-a", "namespace-b"]);
+        let sync = sync_connection_configs(&state, std::slice::from_ref(&scope_updated)).await;
+
+        assert_eq!(sync.connection_pool_ids_to_drop.as_slice(), std::slice::from_ref(&initial.id));
+        for (owner, password) in [("token-a", "owner-a-secret"), ("token-b", "owner-b-secret")] {
+            assert_eq!(state.app.session_credentials.get(owner, &initial.id).as_deref(), Some(password));
+            assert_eq!(
+                state.app.session_credentials.get_for_purpose(owner, &initial.id, "nacos-primary-password").as_deref(),
+                Some(password)
+            );
+        }
+
+        let mut endpoint_updated = scope_updated;
+        endpoint_updated.host = "nacos.internal".to_string();
+        endpoint_updated.external_config.as_mut().unwrap()["serverAddr"] =
+            serde_json::json!("http://nacos.internal:8848");
+        sync_connection_configs(&state, std::slice::from_ref(&endpoint_updated)).await;
+        for owner in ["token-a", "token-b"] {
+            assert!(!state.app.session_credentials.has(owner, &initial.id));
+            assert_eq!(
+                state.app.session_credentials.get_for_purpose(owner, &initial.id, "nacos-primary-password"),
+                None
+            );
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1535,7 +1863,12 @@ mod tests {
             configs.insert(kept.id.clone(), kept.clone());
             configs.insert(removed.id.clone(), removed.clone());
         }
-        state.app.connections.write().await.insert(removed.id.clone(), PoolKind::MessageQueue);
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert(removed.id.clone(), PoolKind::MessageQueue);
+            })
+            .await;
 
         let result = save_connections(
             State(state.clone()),
@@ -1545,7 +1878,7 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(!state.app.connections.read().await.contains_key(&removed.id));
+        assert!(state.app.pool_handle(&removed.id).await.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1560,11 +1893,13 @@ mod tests {
         let conn_pool = dbx_core::db::sqlite::connect_path(&conn_path.to_string_lossy()).await.unwrap();
         let conn2_pool = dbx_core::db::sqlite::connect_path(&conn2_path.to_string_lossy()).await.unwrap();
 
-        {
-            let mut connections = state.app.connections.write().await;
-            connections.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
-            connections.insert("conn2".to_string(), PoolKind::Sqlite(conn2_pool));
-        }
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
+                connections.insert("conn2".to_string(), PoolKind::Sqlite(conn2_pool));
+            })
+            .await;
 
         let result = disconnect_db(
             State(state.clone()),
@@ -1573,9 +1908,10 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        let connections = state.app.connections.read().await;
-        assert!(!connections.contains_key("conn"));
-        assert!(connections.contains_key("conn2"));
+        let (has_conn, has_conn2) =
+            state.app.with_connection_pools(|pools| (pools.contains_key("conn"), pools.contains_key("conn2"))).await;
+        assert!(!has_conn);
+        assert!(has_conn2);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1588,7 +1924,12 @@ mod tests {
         let conn_pool = dbx_core::db::sqlite::connect_path(&conn_path.to_string_lossy()).await.unwrap();
         state.app.begin_connection_attempt_with_client_attempt("conn", Some(1)).await;
         let current_attempt = state.app.begin_connection_attempt_with_client_attempt("conn", Some(2)).await;
-        state.app.connections.write().await.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
+            })
+            .await;
 
         let result = disconnect_db(
             State(state.clone()),
@@ -1597,7 +1938,7 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(state.app.connections.read().await.contains_key("conn"));
+        assert!(state.app.pool_handle("conn").await.is_some());
         assert!(state.app.ensure_current_connection_attempt("conn", Some(current_attempt)).await.is_ok());
 
         let result = disconnect_db(
@@ -1607,7 +1948,7 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(!state.app.connections.read().await.contains_key("conn"));
+        assert!(state.app.pool_handle("conn").await.is_none());
         assert!(state.app.ensure_current_connection_attempt("conn", Some(current_attempt)).await.is_err());
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1620,10 +1961,12 @@ mod tests {
         std::fs::File::create(&conn_path).unwrap();
         let conn_pool = dbx_core::db::sqlite::connect_path(&conn_path.to_string_lossy()).await.unwrap();
 
-        {
-            let mut connections = state.app.connections.write().await;
-            connections.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
-        }
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert("conn".to_string(), PoolKind::Sqlite(conn_pool));
+            })
+            .await;
         {
             let mut configs = state.app.configs.write().await;
             configs.insert("conn".to_string(), sqlite_config("conn", &conn_path.to_string_lossy()));
@@ -1648,7 +1991,12 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let config = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.app.configs.write().await.insert(config.id.clone(), config.clone());
-        state.app.connections.write().await.insert(config.id.clone(), PoolKind::MessageQueue);
+        state
+            .app
+            .update_connection_pools(|connections| {
+                connections.insert(config.id.clone(), PoolKind::MessageQueue);
+            })
+            .await;
         let first = state.app.mq_registry.get_or_build(&config).await.unwrap().adapter;
 
         let result = disconnect_db(
@@ -1658,7 +2006,7 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(!state.app.connections.read().await.contains_key(&config.id));
+        assert!(state.app.pool_handle(&config.id).await.is_none());
         let second = state.app.mq_registry.get_or_build(&config).await.unwrap().adapter;
         assert!(!Arc::ptr_eq(&first, &second));
 

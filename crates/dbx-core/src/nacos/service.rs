@@ -1,8 +1,17 @@
 use std::future::Future;
 
 use crate::connection::AppState;
-use crate::models::connection::DatabaseType;
+use crate::models::connection::{DatabaseConnectionInfo, DatabaseType};
 use crate::nacos::types::*;
+
+pub fn database_info_from_connection(info: &NacosConnectionInfo) -> Option<DatabaseConnectionInfo> {
+    let product_version = info.server_version.clone().filter(|value| !value.trim().is_empty());
+    Some(DatabaseConnectionInfo {
+        product_name: Some("Nacos".to_string()),
+        product_version,
+        ..DatabaseConnectionInfo::default()
+    })
+}
 
 async fn refresh_access_control_after_mutation(admin: &std::sync::Arc<dyn crate::nacos::port::NacosAdmin>) {
     admin.invalidate_access_control_capabilities();
@@ -40,7 +49,11 @@ fn ensure_access_control_operation(
     ))
 }
 
-pub async fn nacos_test_connection_core(state: &AppState, conn_id: &str) -> Result<NacosConnectionInfo, String> {
+pub async fn nacos_test_connection_core(
+    state: &AppState,
+    conn_id: &str,
+    force_access_control_refresh: bool,
+) -> Result<NacosConnectionInfo, String> {
     let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
     if cfg.db_type != DatabaseType::Nacos {
         return Err("Connection is not a Nacos admin connection".to_string());
@@ -49,20 +62,31 @@ pub async fn nacos_test_connection_core(state: &AppState, conn_id: &str) -> Resu
     // Keep this probe on the connection's shared adapter so an r-nacos console
     // session verified for configuration history can also expose its version.
     let admin = state.nacos_registry.get_or_build_config(conn_id, admin_config).await?;
+    if force_access_control_refresh {
+        admin.invalidate_access_control_capabilities();
+    }
     admin.inspect_connection().await
 }
 
 pub async fn nacos_list_namespaces_core(state: &AppState, conn_id: &str) -> Result<Vec<NacosNamespaceInfo>, String> {
     let (admin, fingerprint) = get_admin_with_operation_fingerprint(state, conn_id).await?;
-    crate::nacos::namespace_access::list_readable_namespaces(conn_id, fingerprint, admin).await
+    crate::nacos::namespace_access::list_displayable_namespaces(conn_id, fingerprint, admin).await
 }
 
 pub async fn nacos_sidebar_snapshot_core(
     state: &AppState,
     conn_id: &str,
 ) -> Result<NacosNamespaceSidebarSnapshot, String> {
+    let visible_scope =
+        state.configs.read().await.get(conn_id).ok_or("Connection not found")?.visible_databases.clone();
     let (admin, fingerprint) = get_admin_with_operation_fingerprint(state, conn_id).await?;
-    crate::nacos::namespace_access::sidebar_snapshot(conn_id, fingerprint, admin).await
+    crate::nacos::namespace_access::sidebar_snapshot_with_visible_scope(
+        conn_id,
+        fingerprint,
+        admin,
+        visible_scope.as_deref(),
+    )
+    .await
 }
 
 pub async fn nacos_create_namespace_core(
@@ -72,7 +96,11 @@ pub async fn nacos_create_namespace_core(
 ) -> Result<(), String> {
     ensure_connection_writable(state, conn_id, "Create Nacos namespace").await?;
     let admin = get_admin(state, conn_id).await?;
-    admin.create_namespace(req).await
+    let result = admin.create_namespace(req).await;
+    if result.is_ok() {
+        crate::nacos::namespace_access::invalidate(conn_id);
+    }
+    result
 }
 
 pub async fn nacos_update_namespace_core(
@@ -82,7 +110,21 @@ pub async fn nacos_update_namespace_core(
 ) -> Result<(), String> {
     ensure_connection_writable(state, conn_id, "Update Nacos namespace").await?;
     let admin = get_admin(state, conn_id).await?;
-    admin.update_namespace(req).await
+    let result = admin.update_namespace(req).await;
+    if result.is_ok() {
+        crate::nacos::namespace_access::invalidate(conn_id);
+    }
+    result
+}
+
+pub async fn nacos_delete_namespace_core(state: &AppState, conn_id: &str, namespace_id: String) -> Result<(), String> {
+    ensure_connection_writable(state, conn_id, "Delete Nacos namespace").await?;
+    let admin = get_admin(state, conn_id).await?;
+    let result = admin.delete_namespace(namespace_id).await;
+    if result.is_ok() {
+        crate::nacos::namespace_access::invalidate(conn_id);
+    }
+    result
 }
 
 pub async fn nacos_list_configs_core(
@@ -512,7 +554,7 @@ async fn get_admin_with_operation_fingerprint(
 
 pub(crate) async fn ensure_connection_writable(state: &AppState, conn_id: &str, action: &str) -> Result<(), String> {
     let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
-    if cfg.read_only {
+    if cfg.read_only && !state.write_unlock_windows.is_active(conn_id).await {
         Err(format!("{action} is blocked because this connection is read-only"))
     } else {
         Ok(())
@@ -571,6 +613,7 @@ mod tests {
             display_server_addr: "http://127.0.0.1:3848".to_string(),
             namespace: "public".to_string(),
             version_mode: Some(NacosVersionMode::Auto),
+            api_plane: None,
             context_path: "/nacos".to_string(),
             managed_namespaces: Vec::new(),
             rnacos_console_addr: String::new(),
@@ -616,6 +659,7 @@ mod tests {
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -643,10 +687,16 @@ mod tests {
             redis_key_separator: ":".to_string(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: Some(serde_json::json!({ "serverAddr": "http://127.0.0.1:9" })),
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: std::collections::HashMap::new(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -692,6 +742,7 @@ mod tests {
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -719,10 +770,16 @@ mod tests {
             redis_key_separator: ":".to_string(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: Some(serde_json::json!({ "serverAddr": "http://127.0.0.1:9" })),
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: std::collections::HashMap::new(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,

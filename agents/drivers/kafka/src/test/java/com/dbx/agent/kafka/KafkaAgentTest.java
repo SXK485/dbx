@@ -13,6 +13,8 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyStore;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -27,8 +29,11 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.Config;
@@ -55,6 +60,146 @@ import org.junit.jupiter.api.io.TempDir;
 class KafkaAgentTest {
     @TempDir
     Path tempDir;
+
+    @Test
+    void consumerGroupSnapshotCalculatesLagAndSortsTopicsAndPartitions() {
+        TopicPartition alphaOne = new TopicPartition("alpha", 1);
+        TopicPartition alphaZero = new TopicPartition("alpha", 0);
+        TopicPartition betaZero = new TopicPartition("beta", 0);
+
+        Map<String, Object> group = KafkaAgent.consumerGroupSnapshotRow(
+            "orders-service",
+            "STABLE",
+            false,
+            2,
+            Arrays.asList(betaZero, alphaOne, alphaZero),
+            Map.of(
+                alphaZero, new OffsetAndMetadata(8),
+                alphaOne, new OffsetAndMetadata(20),
+                betaZero, new OffsetAndMetadata(5)
+            ),
+            true,
+            Map.of(alphaZero, 10L, alphaOne, 24L, betaZero, 6L),
+            Collections.emptyList()
+        );
+
+        assertEquals(List.of("alpha", "beta"), group.get("topics"));
+        assertEquals(7L, group.get("totalLag"));
+        assertEquals(true, group.get("lagAvailable"));
+        assertEquals(2, group.get("memberCount"));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> partitions = (List<Map<String, Object>>) group.get("partitions");
+        assertEquals(
+            List.of("alpha:0", "alpha:1", "beta:0"),
+            partitions.stream()
+                .map(partition -> partition.get("topic") + ":" + partition.get("partition"))
+                .toList()
+        );
+    }
+
+    @Test
+    void consumerGroupSnapshotDoesNotReportUnknownLagAsZero() {
+        TopicPartition assignedOnly = new TopicPartition("orders", 0);
+        Map<String, Object> group = KafkaAgent.consumerGroupSnapshotRow(
+            "new-consumer",
+            "EMPTY",
+            false,
+            0,
+            Collections.singletonList(assignedOnly),
+            Collections.emptyMap(),
+            true,
+            Collections.singletonMap(assignedOnly, 42L),
+            Collections.emptyList()
+        );
+
+        assertEquals(false, group.get("lagAvailable"));
+        assertNull(group.get("totalLag"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> partitions = (List<Map<String, Object>>) group.get("partitions");
+        assertNull(partitions.get(0).get("currentOffset"));
+        assertNull(partitions.get(0).get("lag"));
+    }
+
+    @Test
+    void consumerGroupSnapshotPreservesPartialFailuresWithoutInventingLag() {
+        TopicPartition partition = new TopicPartition("orders", 0);
+        Map<String, Object> group = KafkaAgent.consumerGroupSnapshotRow(
+            "orders-service",
+            "UNKNOWN",
+            false,
+            null,
+            Collections.emptyList(),
+            Collections.singletonMap(partition, new OffsetAndMetadata(9)),
+            true,
+            Collections.emptyMap(),
+            Collections.singletonList("End offsets unavailable for 1 partition(s)")
+        );
+
+        assertEquals(false, group.get("lagAvailable"));
+        assertNull(group.get("totalLag"));
+        assertNull(group.get("memberCount"));
+        assertEquals("End offsets unavailable for 1 partition(s)", group.get("error"));
+    }
+
+    @Test
+    void consumerGroupListRowsFilterToTheRequestedTopicAndSortByPartition() {
+        Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+        offsets.put(new TopicPartition("orders", 2), new OffsetAndMetadata(20));
+        offsets.put(new TopicPartition("payments", 0), new OffsetAndMetadata(5));
+        offsets.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+
+        List<Map<String, Object>> rows = KafkaAgent.offsetRows(offsets, "orders");
+
+        assertEquals(List.of("orders:0", "orders:2"), rows.stream()
+            .map(row -> row.get("topic") + ":" + row.get("partition"))
+            .toList());
+        assertEquals(8L, rows.get(0).get("offset"));
+        assertEquals(20L, rows.get(1).get("offset"));
+    }
+
+    @Test
+    void consumerGroupListRowsKeepEveryPartitionWithoutATopicFilter() {
+        Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+        offsets.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+        offsets.put(new TopicPartition("payments", 1), new OffsetAndMetadata(3));
+
+        List<Map<String, Object>> rows = KafkaAgent.offsetRows(offsets, "");
+
+        assertEquals(2, rows.size());
+    }
+
+    @Test
+    void consumerGroupListEndOffsetRowsSkipPartitionsWithoutResolvedEndOffsets() {
+        Map<TopicPartition, OffsetAndMetadata> committed = new HashMap<>();
+        committed.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+        committed.put(new TopicPartition("orders", 1), new OffsetAndMetadata(20));
+        Map<TopicPartition, Long> endOffsets = new HashMap<>();
+        endOffsets.put(new TopicPartition("orders", 1), 24L);
+
+        List<Map<String, Object>> rows = KafkaAgent.endOffsetRows(committed, endOffsets, "orders");
+
+        assertEquals(List.of("orders:1"), rows.stream()
+            .map(row -> row.get("topic") + ":" + row.get("partition"))
+            .toList());
+        assertEquals(24L, rows.get(0).get("offset"));
+    }
+
+    @Test
+    void consumerGroupListEndOffsetRowsFilterToTheRequestedTopic() {
+        Map<TopicPartition, OffsetAndMetadata> committed = new HashMap<>();
+        committed.put(new TopicPartition("orders", 0), new OffsetAndMetadata(8));
+        committed.put(new TopicPartition("payments", 0), new OffsetAndMetadata(4));
+        Map<TopicPartition, Long> endOffsets = new HashMap<>();
+        endOffsets.put(new TopicPartition("orders", 0), 10L);
+        endOffsets.put(new TopicPartition("payments", 0), 9L);
+
+        List<Map<String, Object>> rows = KafkaAgent.endOffsetRows(committed, endOffsets, "orders");
+
+        assertEquals(List.of("orders:0"), rows.stream()
+            .map(row -> row.get("topic") + ":" + row.get("partition"))
+            .toList());
+    }
 
     @Test
     void explicitConsumerGroupOffsetsAcceptOneBoundedPartitionOffset() {
@@ -108,6 +253,25 @@ class KafkaAgentTest {
         assertEquals(true, topics.get(0).get("internal"));
         assertFalse(topics.get(0).containsKey("partitions"));
         assertFalse(topics.get(1).containsKey("partitions"));
+    }
+
+    @Test
+    void topicListingFallsBackWhenDescriptionsTimeOut() throws Exception {
+        Object result = KafkaAgent.topicListResult(
+            Arrays.asList(
+                new TopicListing("orders", Uuid.randomUuid(), false),
+                new TopicListing("payments", Uuid.randomUuid(), false)
+            ),
+            names -> {
+                throw new java.util.concurrent.TimeoutException("describeTopics timed out");
+            }
+        );
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> topics = (List<Map<String, Object>>) ((Map<String, Object>) result).get("topics");
+        assertEquals(Arrays.asList("orders", "payments"), topics.stream().map(topic -> topic.get("name")).toList());
+        assertFalse(topics.get(0).containsKey("partitions"));
+        assertFalse(topics.get(1).containsKey("replicationFactor"));
     }
 
     @Test
@@ -1208,6 +1372,46 @@ class KafkaAgentTest {
             "com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true keyTab=\"/tmp/user.keytab\" principal=\"user@EXAMPLE.COM\";",
             props.getProperty("sasl.jaas.config")
         );
+    }
+
+    @Test
+    void skipTlsVerificationDisablesHostnameAndCertificateChainValidation() throws Exception {
+        Properties props = new Properties();
+        KafkaAgent.applyConnectionProperties(JsonParser.parseString("""
+            {
+              "security_protocol": "SASL_SSL",
+              "tls_skip_verify": true,
+              "properties": {
+                "ssl.endpoint.identification.algorithm": "https",
+                "ssl.trustmanager.algorithm": "PKIX"
+              }
+            }
+            """).getAsJsonObject(), props);
+
+        assertEquals("", props.getProperty("ssl.endpoint.identification.algorithm"));
+        assertEquals(
+            DbxInsecureTrustManagerFactory.ALGORITHM,
+            props.getProperty("ssl.trustmanager.algorithm")
+        );
+
+        TrustManagerFactory factory = TrustManagerFactory.getInstance(DbxInsecureTrustManagerFactory.ALGORITHM);
+        factory.init((KeyStore) null);
+        X509TrustManager trustManager = (X509TrustManager) factory.getTrustManagers()[0];
+        assertDoesNotThrow(() -> trustManager.checkServerTrusted(new X509Certificate[0], "RSA"));
+    }
+
+    @Test
+    void verifiedTlsKeepsKafkaDefaultTrustAndHostnameValidation() {
+        Properties props = new Properties();
+        KafkaAgent.applyConnectionProperties(JsonParser.parseString("""
+            {
+              "security_protocol": "SASL_SSL",
+              "tls_skip_verify": false
+            }
+            """).getAsJsonObject(), props);
+
+        assertNull(props.getProperty("ssl.endpoint.identification.algorithm"));
+        assertNull(props.getProperty("ssl.trustmanager.algorithm"));
     }
 
     @Test

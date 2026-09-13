@@ -35,6 +35,7 @@ import {
 } from "../../apps/desktop/src/lib/mongo/mongoShellCommand.ts";
 import type { MongoWriteCommand } from "../../apps/desktop/src/lib/mongo/mongoShellCommand.ts";
 import { buildMongoUpdateDocument as buildMongoDocumentUpdate, formatMongoShellLiteral as formatMongoDocumentShellLiteral } from "../../apps/desktop/src/lib/mongo/mongoDocumentValues.ts";
+import { normalizeJsonArgument } from "../mongo-shell/src/json.ts";
 
 test("parseMongoFindCommand parses db collection find with an empty JSON filter", () => {
   assert.deepEqual(parseMongoFindCommand("db.users.find({})"), {
@@ -310,6 +311,139 @@ test("parseMongoFindCommand rewrites NumberLong into extended JSON", () => {
   assert.deepEqual(JSON.parse(quoted.filter), { _id: { $numberLong: "2048938405781032962" } });
   assert.ok(unquoted);
   assert.deepEqual(JSON.parse(unquoted.filter), { snowflake: { $numberLong: "9007199254740993" } });
+});
+
+test("parseMongoWriteCommand fills in zero-argument new Date, ISODate and ObjectId", () => {
+  const before = Date.now();
+  const command = parseMongoWriteCommand(`db.reports.updateOne(
+    { phone_number: "+84905421172", code: "VN" },
+    { $set: { type: ObjectId("5bbc28701f3fd80f00e0211c"), created_at: new Date(), updated_at: ISODate() } },
+    { upsert: true }
+  )`);
+  assert.ok(command);
+  assert.equal(command.kind, "update");
+  const update = JSON.parse(command.update) as { $set: Record<string, { $date?: string; $oid?: string }> };
+  assert.deepEqual(update.$set.type, { $oid: "5bbc28701f3fd80f00e0211c" });
+  for (const field of ["created_at", "updated_at"] as const) {
+    const filled = Date.parse(update.$set[field]!.$date!);
+    assert.ok(filled >= before && filled <= Date.now(), `${field} is not the current time`);
+  }
+  assert.match(JSON.parse(parseMongoFindCommand("db.reports.find({_id: ObjectId()})")!.filter)._id.$oid, /^[0-9a-f]{24}$/);
+});
+
+test("parseMongoFindCommand rewrites epoch-millisecond and numeric BSON constructors", () => {
+  const command = parseMongoFindCommand('db.orders.find({at: new Date(1735689600000), qty: NumberInt(3), total: NumberDecimal("12.34")})');
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), {
+    at: { $date: { $numberLong: "1735689600000" } },
+    qty: { $numberInt: "3" },
+    total: { $numberDecimal: "12.34" },
+  });
+});
+
+test("parseMongoFindCommand rejects out-of-range integer constructor arguments", () => {
+  assert.equal(parseMongoFindCommand("db.orders.find({a: NumberLong(9223372036854775808)})"), null);
+  assert.equal(parseMongoFindCommand("db.orders.find({a: NumberLong(-9223372036854775809)})"), null);
+  assert.equal(parseMongoFindCommand("db.orders.find({a: NumberInt(2147483648)})"), null);
+  assert.equal(parseMongoFindCommand("db.orders.find({a: new Date(99999999999999999999)})"), null);
+  const atBounds = parseMongoFindCommand("db.orders.find({a: NumberLong(9223372036854775807), b: NumberInt(-2147483648)})");
+  assert.ok(atBounds);
+  assert.deepEqual(JSON.parse(atBounds.filter), { a: { $numberLong: "9223372036854775807" }, b: { $numberInt: "-2147483648" } });
+});
+
+test("parseMongoFindCommand does not rewrite constructor text inside strings", () => {
+  const command = parseMongoFindCommand(`db.orders.find({label: "new Date()", note: 'ObjectId()'})`);
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), { label: "new Date()", note: "ObjectId()" });
+});
+
+test('parseMongoCommand accepts db["name"] bracket collection accessors', () => {
+  const find = parseMongoFindCommand('db["orders-2024"].find({a: 1})');
+  assert.ok(find);
+  assert.equal(find.collection, "orders-2024");
+  assert.deepEqual(JSON.parse(find.filter), { a: 1 });
+
+  // Single quotes and a dotted name behave like db.<name>.
+  assert.equal(parseMongoFindCommand("db['audit.logs'].find({})")?.collection, "audit.logs");
+
+  assert.deepEqual(parseMongoWriteCommand('db["orders-2024"].updateOne({a: 1}, {$set: {b: 2}}, {upsert: true})'), {
+    kind: "update",
+    collection: "orders-2024",
+    filter: '{"a": 1}',
+    update: '{"$set": {"b": 2}}',
+    options: '{"upsert": true}',
+    many: false,
+  });
+
+  for (const source of ["db[].find({})", 'db["x"]find({})', 'db["x"]']) {
+    assert.equal(parseMongoCommand(source), null, source);
+  }
+});
+
+test("parseMongoFindCommand rewrites UUID, BinData, Timestamp and MinKey/MaxKey", () => {
+  const command = parseMongoFindCommand(`db.c.find({
+    u: UUID("3b241101-e2bb-4255-8caf-4136c566a962"),
+    b: BinData(128, "AQID"),
+    t: Timestamp(1735689600, 7),
+    lo: MinKey,
+    hi: MaxKey(),
+    range: {$gt: MinKey(), $lt: MaxKey},
+    list: [MinKey, MaxKey]
+  })`);
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), {
+    u: { $uuid: "3b241101-e2bb-4255-8caf-4136c566a962" },
+    b: { $binary: { base64: "AQID", subType: "80" } },
+    t: { $timestamp: { t: 1735689600, i: 7 } },
+    lo: { $minKey: 1 },
+    hi: { $maxKey: 1 },
+    range: { $gt: { $minKey: 1 }, $lt: { $maxKey: 1 } },
+    list: [{ $minKey: 1 }, { $maxKey: 1 }],
+  });
+
+  const generated = JSON.parse(parseMongoFindCommand("db.c.find({u: UUID()})")!.filter).u.$uuid;
+  assert.match(generated, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+});
+
+test("parseMongoFindCommand leaves MinKey/MaxKey alone outside value positions", () => {
+  const command = parseMongoFindCommand('db.c.find({MinKey: 1, MaxKey: 2, label: "MinKey", nested: {MaxKey: true}})');
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), { MinKey: 1, MaxKey: 2, label: "MinKey", nested: { MaxKey: true } });
+});
+
+test("parseMongoFindCommand rejects malformed UUID, BinData, Timestamp and MinKey/MaxKey", () => {
+  for (const source of [
+    'db.c.find({b: BinData(256, "x")})',
+    "db.c.find({b: BinData(0)})",
+    'db.c.find({b: BinData("00", "x")})',
+    "db.c.find({t: Timestamp(1)})",
+    "db.c.find({t: Timestamp(-1, 0)})",
+    "db.c.find({t: Timestamp(4294967296, 0)})",
+    "db.c.find({u: UUID(1)})",
+    "db.c.find({a: MinKey(1)})",
+    'db.c.find({a: MaxKey("x")})',
+  ]) {
+    assert.equal(parseMongoFindCommand(source), null, source);
+  }
+});
+
+test("parseMongoFindCommand validates UUID strings at parse time", () => {
+  // mongosh requires the canonical 8-4-4-4-12 hex form: dashes at fixed
+  // positions, hex digits elsewhere.
+  for (const source of [
+    'db.c.find({u: UUID("3b241101e2bb42558caf4136c566a962")})',
+    'db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a96")})',
+    'db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a9620")})',
+    'db.c.find({u: UUID("zb241101-e2bb-4255-8caf-4136c566a962")})',
+    'db.c.find({u: UUID("3b241101_e2bb_4255_8caf_4136c566a962")})',
+  ]) {
+    assert.equal(parseMongoFindCommand(source), null, source);
+  }
+
+  // Upper-case hex is accepted and preserved verbatim.
+  const command = parseMongoFindCommand('db.c.find({u: UUID("3B241101-E2BB-4255-8CAF-4136C566A962")})');
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), { u: { $uuid: "3B241101-E2BB-4255-8CAF-4136C566A962" } });
 });
 
 test("parseMongoFindCommand accepts single-quoted string values and unquoted sort keys", () => {
@@ -594,6 +728,87 @@ test("parseMongoWriteCommand accepts updateMany arrayFilters options", () => {
       many: true,
     },
   );
+});
+
+test("parseMongoWriteCommand accepts Mongo shell regex literals", () => {
+  const command = parseMongoWriteCommand(`db.code_info.updateMany(
+    { level: "SECOND_LAYER", position: "B", packagingRatio: /^[^:：]*盒/, type: { $ne: "PACK_IN" } },
+    { $set: { type: "PACK_IN" }, $currentDate: { lastUpdateTime: true } }
+  )`);
+
+  assert.equal(command?.kind, "update");
+  if (command?.kind !== "update") return;
+  assert.equal(command.collection, "code_info");
+  assert.equal(command.many, true);
+  assert.deepEqual(JSON.parse(command.filter), {
+    level: "SECOND_LAYER",
+    position: "B",
+    packagingRatio: { $regularExpression: { pattern: "^[^:：]*盒", options: "" } },
+    type: { $ne: "PACK_IN" },
+  });
+});
+
+test("parseMongoWriteCommand ignores delimiters inside Mongo shell regex literals", () => {
+  const command = parseMongoWriteCommand(String.raw`db.items.updateMany({ value: /a\),b/ }, { $set: { matched: true } })`);
+
+  assert.equal(command?.kind, "update");
+  if (command?.kind !== "update") return;
+  assert.deepEqual(JSON.parse(command.filter), {
+    value: { $regularExpression: { pattern: "a\\),b", options: "" } },
+  });
+});
+
+test("normalizeJsonArgument handles regex escapes, character classes, flags, strings, and comments", () => {
+  const normalized = normalizeJsonArgument(`{
+    pattern: /a\\/b[/:：]/mi,
+    url: "https://example.com/a/b",
+    note: "// remains text",
+    // slash comments remain comments
+    active: true
+  }`);
+
+  assert.ok(normalized);
+  assert.deepEqual(JSON.parse(normalized), {
+    pattern: { $regularExpression: { pattern: "a\\/b[/:：]", options: "im" } },
+    url: "https://example.com/a/b",
+    note: "// remains text",
+    active: true,
+  });
+});
+
+test("normalizeJsonArgument accepts a regex literal after comments", () => {
+  const normalized = normalizeJsonArgument(`{
+    block: /* explain the pattern */ /block/i,
+    line: // explain the next pattern
+      /line/m
+  }`);
+
+  assert.ok(normalized);
+  assert.deepEqual(JSON.parse(normalized), {
+    block: { $regularExpression: { pattern: "block", options: "i" } },
+    line: { $regularExpression: { pattern: "line", options: "m" } },
+  });
+});
+
+test("normalizeJsonArgument drops JS-only regex literal flags", () => {
+  const normalized = normalizeJsonArgument(`{
+    global: /value/g,
+    sticky: /value/yd,
+    verbose: /value/givs
+  }`);
+
+  assert.ok(normalized);
+  assert.deepEqual(JSON.parse(normalized), {
+    global: { $regularExpression: { pattern: "value", options: "" } },
+    sticky: { $regularExpression: { pattern: "value", options: "" } },
+    verbose: { $regularExpression: { pattern: "value", options: "is" } },
+  });
+});
+
+test("normalizeJsonArgument rejects malformed Mongo shell regex literals", () => {
+  for (const source of ["{pattern: /unterminated}", "{pattern: /value/ii}", "{pattern: /value/q}"]) {
+    assert.equal(normalizeJsonArgument(source), null, source);
+  }
 });
 
 test("parseMongoWriteCommand parses createIndex with optional options", () => {

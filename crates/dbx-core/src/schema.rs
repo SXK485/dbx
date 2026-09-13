@@ -6,17 +6,18 @@ use crate::connection::{
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query::{agent_execute_query_params, should_discard_pool_after_error, QueryExecutionOptions};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 mod kingbase;
 
 macro_rules! extract_pool {
-    ($connections:expr, $key:expr, $variant:ident) => {
-        $connections.get($key).and_then(|v| match v {
+    ($pool:expr, $variant:ident) => {
+        $pool.and_then(|v| match v {
             PoolKind::$variant(val) => Some(val.clone()),
             _ => None,
         })
@@ -34,7 +35,7 @@ macro_rules! dispatch_mysql {
 }
 
 async fn clone_metadata_pool(state: &AppState, pool_key: &str) -> Option<PoolKind> {
-    state.connections.read().await.get(pool_key).and_then(PoolKind::clone_for_metadata)
+    state.pool_handle(pool_key).await
 }
 
 struct EphemeralAgentMetadataSession {
@@ -69,9 +70,8 @@ impl EphemeralAgentMetadataSession {
 }
 
 macro_rules! try_sqlserver {
-    ($connections:expr, $pool_key:expr, $method:ident $(, $arg:expr)*) => {
-        if let Some(client) = extract_pool!(&$connections, $pool_key, SqlServer) {
-            drop($connections);
+    ($pool:expr, $method:ident $(, $arg:expr)*) => {
+        if let Some(client) = extract_pool!($pool.as_ref(), SqlServer) {
             let mut client = lock_sqlserver_metadata_client(&client).await?;
             return db::sqlserver::$method(&mut client $(, $arg)*).await;
         }
@@ -197,6 +197,39 @@ pub async fn list_databases_core(state: &AppState, connection_id: &str) -> Resul
     retry_metadata_connection(state, connection_id, None, || list_databases_once(state, connection_id)).await
 }
 
+/// Lists XuguDB tablespaces and their physical data files for the selected
+/// database. This is deliberately a no-op for every other database type so
+/// the common schema surface and non-Xugu drivers remain untouched.
+pub async fn list_xugu_tablespaces_core(
+    state: &AppState,
+    connection_id: &str,
+    database: Option<&str>,
+) -> Result<Vec<db::XuguTablespaceInfo>, String> {
+    let config = connection_config(state, connection_id).await;
+    if !config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Xugu) {
+        return Ok(Vec::new());
+    }
+    retry_metadata_connection(state, connection_id, database.filter(|database| !database.is_empty()), || async {
+        let pool_key = state
+            .get_or_create_metadata_pool_for_session(
+                connection_id,
+                database.filter(|database| !database.is_empty()),
+                None,
+            )
+            .await?;
+        let config = connection_config(state, connection_id).await;
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
+            let mut client = client.lock().await;
+            return client
+                .list_xugu_tablespaces::<Vec<db::XuguTablespaceInfo>>(database, agent_metadata_timeout(config.as_ref()))
+                .await;
+        }
+        Ok(Vec::new())
+    })
+    .await
+}
+
 /// Loads the more expensive database-level properties needed only by the
 /// connection resource browser. General metadata paths keep using
 /// `list_databases_core`, which only enumerates names.
@@ -237,8 +270,8 @@ async fn list_database_storage_once(
     }
 
     let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(connection_id) {
+        let pool_handle = state.pool_handle(connection_id).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => pool.clone(),
             _ => return Ok(Vec::new()),
         }
@@ -273,9 +306,8 @@ pub async fn list_sqlserver_linked_servers_core(
     connection_id: &str,
 ) -> Result<Vec<db::LinkedServerInfo>, String> {
     let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
+    let pool_handle = state.pool_handle(connection_id).await;
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
         let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_servers(&mut client).await;
     }
@@ -290,18 +322,20 @@ pub async fn get_sqlserver_completion_context_core(
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
         let db_config = connection_config(state, connection_id).await;
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+        let completion_context_sql = db::sqlserver::completion_context_sql_for_profile(
+            db_config.as_ref().and_then(|config| config.driver_profile.as_deref()),
+        );
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             let result: db::QueryResult = session
                 .invoke_with_timeout(
                     "executeQuery",
                     serde_json::json!({
                         "connection": config.as_ref(),
                         "database": database,
-                        "sql": db::sqlserver::completion_context_sql(),
+                        "sql": completion_context_sql,
                         "maxRows": 1
                     }),
                     agent_metadata_timeout(Some(config.as_ref())),
@@ -309,14 +343,13 @@ pub async fn get_sqlserver_completion_context_core(
                 .await?;
             return db::sqlserver::completion_context_from_query_result(result);
         }
-        try_sqlserver!(connections, &pool_key, get_completion_context);
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
+        try_sqlserver!(pool_handle, get_completion_context);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let mut client = client.lock().await;
             let result = client
                 .execute_query_with_timeout::<db::QueryResult>(
                     agent_execute_query_params(
-                        db::sqlserver::completion_context_sql(),
+                        completion_context_sql,
                         if database.is_empty() { None } else { Some(database) },
                         None,
                         QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
@@ -337,9 +370,8 @@ pub async fn list_sqlserver_linked_server_catalogs_core(
     server: &str,
 ) -> Result<Vec<db::DatabaseInfo>, String> {
     let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
+    let pool_handle = state.pool_handle(connection_id).await;
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
         let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_server_catalogs(&mut client, server).await;
     }
@@ -353,9 +385,8 @@ pub async fn list_sqlserver_linked_server_schemas_core(
     catalog: &str,
 ) -> Result<Vec<String>, String> {
     let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
+    let pool_handle = state.pool_handle(connection_id).await;
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
         let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_server_schemas(&mut client, server, catalog).await;
     }
@@ -373,9 +404,8 @@ pub async fn list_sqlserver_linked_server_tables_core(
     offset: Option<usize>,
 ) -> Result<Vec<db::TableInfo>, String> {
     let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
+    let pool_handle = state.pool_handle(connection_id).await;
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
         let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_server_tables(&mut client, server, catalog, schema, filter, limit, offset)
             .await;
@@ -683,11 +713,10 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
     log::info!("[list_databases] connection_id={connection_id}");
     let db_config = connection_config(state, connection_id).await;
     {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(connection_id) {
+        let pool_handle = state.pool_handle(connection_id).await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             return session
                 .invoke_with_timeout::<Vec<db::DatabaseInfo>>(
                     "listDatabases",
@@ -696,27 +725,25 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
                 )
                 .await;
         }
-        if let Some(client) = extract_pool!(&connections, connection_id, ClickHouse) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), ClickHouse) {
             return db::clickhouse_driver::list_databases(&client).await;
         }
-        if let Some(client) = extract_pool!(&connections, connection_id, InfluxDb) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), InfluxDb) {
             return db::influxdb_driver::list_databases(&client).await;
         }
-        if let Some(client) = extract_pool!(&connections, connection_id, VictoriaMetrics) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), InfluxDb3) {
+            return db::influxdb3_driver::list_databases(&client).await;
+        }
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), VictoriaMetrics) {
             return db::victoriametrics_driver::list_databases(&client).await;
         }
-        try_sqlserver!(connections, connection_id, list_databases);
-        if let Some(client) = extract_pool!(&connections, connection_id, Agent) {
+        try_sqlserver!(pool_handle, list_databases);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let is_mongo = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::MongoDb);
             if is_mongo {
-                drop(connections);
                 let dbs = crate::mongo_ops::mongo_list_databases_core(state, connection_id).await?;
                 return Ok(dbs.into_iter().map(|name| db::DatabaseInfo { name, ..Default::default() }).collect());
             }
-            drop(connections);
             let mut client = client.lock().await;
             return client.list_databases(agent_metadata_timeout(db_config.as_ref())).await;
         }
@@ -759,27 +786,23 @@ async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> R
     {
         return list_databases_once(state, connection_id).await;
     }
-    let connections = state.connections.read().await;
-    if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
-        drop(connections);
+    let pool_handle = state.pool_handle(connection_id).await;
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
         let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_database_metadata(&mut client).await;
     }
-    if let Some(PoolKind::Mysql(pool, mode)) = connections.get(connection_id) {
+    if let Some(PoolKind::Mysql(pool, mode)) = pool_handle.as_ref() {
         let pool = pool.clone();
         let mode = *mode;
-        drop(connections);
         return if mode == MysqlMode::OceanBaseOracle {
             db::ob_oracle::list_databases(&pool).await
         } else {
             db::mysql::list_database_metadata(&pool).await
         };
     }
-    if let Some(pool) = extract_pool!(&connections, connection_id, Postgres) {
-        drop(connections);
+    if let Some(pool) = extract_pool!(pool_handle.as_ref(), Postgres) {
         return db::postgres::list_database_metadata(&pool).await;
     }
-    drop(connections);
     list_databases_once(state, connection_id).await
 }
 
@@ -834,11 +857,10 @@ pub async fn list_data_types_core(
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let db_config = connection_config(state, connection_id).await;
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             return session
                 .invoke_with_timeout::<Vec<String>>(
                     "listDataTypes",
@@ -848,8 +870,7 @@ pub async fn list_data_types_core(
                 .await
                 .map(deduplicate_data_type_names);
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let mut client = client.lock().await;
             return client
                 .list_data_types::<Vec<String>>(database, agent_metadata_timeout(db_config.as_ref()))
@@ -889,11 +910,10 @@ async fn list_schemas_once(
     let visible_schema_filter = visible_schema_filter(db_config.as_ref(), database, apply_visible_filter);
 
     {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             return session
                 .invoke_with_timeout::<Vec<String>>(
                     "listSchemas",
@@ -902,10 +922,9 @@ async fn list_schemas_once(
                 )
                 .await;
         }
-        try_sqlserver!(connections, &pool_key, list_schemas);
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+        try_sqlserver!(pool_handle, list_schemas);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let fallback_config = db_config.clone();
-            drop(connections);
             let mut client = client.lock().await;
             match client
                 .list_schemas_filtered::<Vec<String>>(
@@ -1056,8 +1075,8 @@ pub async fn list_vector_collections_core(
         )
         .await?;
     let client = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::VectorDb(client)) => client.clone(),
             _ => return Err("Not a vector database connection".to_string()),
         }
@@ -1080,13 +1099,60 @@ pub async fn get_vector_collection_detail_core(
         )
         .await?;
     let client = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::VectorDb(client)) => client.clone(),
             _ => return Err("Not a vector database connection".to_string()),
         }
     };
     db::vector_driver::get_collection_detail(&client, database, collection).await
+}
+
+pub async fn drop_vector_database_core(state: &AppState, connection_id: &str, database: &str) -> Result<(), String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let client = {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
+            Some(PoolKind::VectorDb(client)) => client.clone(),
+            _ => return Err("Not a vector database connection".to_string()),
+        }
+    };
+    db::vector_driver::drop_database(&client, database).await
+}
+
+pub async fn drop_vector_collection_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+) -> Result<(), String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let client = {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
+            Some(PoolKind::VectorDb(client)) => client.clone(),
+            _ => return Err("Not a vector database connection".to_string()),
+        }
+    };
+    db::vector_driver::drop_collection(&client, database, collection).await
+}
+
+pub async fn rename_vector_collection_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let client = {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
+            Some(PoolKind::VectorDb(client)) => client.clone(),
+            _ => return Err("Not a vector database connection".to_string()),
+        }
+    };
+    db::vector_driver::rename_collection(&client, database, collection, new_name).await
 }
 
 pub async fn get_table_comment_core(
@@ -1115,6 +1181,38 @@ pub async fn get_table_comment_core(
     result
 }
 
+pub async fn get_mysql_table_auto_increment_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    table: &str,
+) -> Result<Option<String>, String> {
+    let db_config = connection_config(state, connection_id).await;
+    let native_mysql = db_config.as_ref().is_some_and(|config| {
+        config.db_type == DatabaseType::Mysql
+            && config
+                .driver_profile
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|profile| profile.is_empty() || profile.eq_ignore_ascii_case("mysql"))
+    });
+    if !native_mysql {
+        return Err("AUTO_INCREMENT metadata is supported only for native MySQL connections.".to_string());
+    }
+
+    retry_metadata_connection_for_session(state, connection_id, Some(database), None, || async {
+        let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+        match &pool {
+            PoolKind::Mysql(pool, mode) if *mode != MysqlMode::OceanBaseOracle => {
+                db::mysql::get_table_auto_increment(pool, database, table).await
+            }
+            _ => Err("AUTO_INCREMENT metadata is supported only for native MySQL connections.".to_string()),
+        }
+    })
+    .await
+}
+
 async fn get_table_comment_core_for_session(
     state: &AppState,
     connection_id: &str,
@@ -1129,15 +1227,14 @@ async fn get_table_comment_core_for_session(
         let db_config = connection_config(state, connection_id).await;
 
         {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, get_table_comment, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            let pool_handle = state.pool_handle(&pool_key).await;
+            try_sqlserver!(pool_handle, get_table_comment, schema, table);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 if db_config.as_ref().is_some_and(|config| {
                     matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
                 }) {
                     let sql = oracle_table_comment_sql(schema, table);
                     let timeout = agent_metadata_timeout(db_config.as_ref());
-                    drop(connections);
                     let mut client = client.lock().await;
                     let result = client
                         .execute_query_with_timeout::<db::QueryResult>(
@@ -1154,7 +1251,6 @@ async fn get_table_comment_core_for_session(
                 }
                 if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
                     let timeout = agent_metadata_timeout(db_config.as_ref());
-                    drop(connections);
                     let mut client = client.lock().await;
                     return client.get_table_comment::<Option<String>>(database, schema, table, timeout).await;
                 }
@@ -1162,7 +1258,6 @@ async fn get_table_comment_core_for_session(
                     let metadata_database = if schema.trim().is_empty() { database } else { schema };
                     let sql = tdengine_table_comment_sql(metadata_database, table);
                     let timeout = agent_metadata_timeout(db_config.as_ref());
-                    drop(connections);
                     let mut client = client.lock().await;
                     let result = client
                         .execute_query_with_timeout::<db::QueryResult>(
@@ -1288,49 +1383,85 @@ fn table_comments_from_query_result(result: db::QueryResult) -> HashMap<String, 
         .collect()
 }
 
-fn oracle_columns_sql(schema: &str, table: &str) -> String {
-    let owner = oracle_columns_owner_filter(schema);
-    format!(
-        "WITH synonym_chain AS ( \
-           SELECT CONNECT_BY_ROOT s.OWNER AS root_owner, \
-                  s.TABLE_OWNER AS resolved_owner, \
-                  s.TABLE_NAME AS resolved_table, \
-                  LEVEL AS synonym_depth \
-           FROM ALL_SYNONYMS s \
-           START WITH s.SYNONYM_NAME = {table} \
-             AND s.OWNER IN ({owner}, 'PUBLIC') \
-             AND s.DB_LINK IS NULL \
-           CONNECT BY NOCYCLE \
-             PRIOR s.TABLE_OWNER = s.OWNER \
-             AND PRIOR s.TABLE_NAME = s.SYNONYM_NAME \
-             AND s.DB_LINK IS NULL \
-         ), \
-         resolved_object AS ( \
-           SELECT resolved_owner, resolved_table \
-           FROM ( \
-             SELECT resolved_owner, resolved_table, resolution_priority, synonym_depth \
-             FROM ( \
-               SELECT o.OWNER AS resolved_owner, o.OBJECT_NAME AS resolved_table, \
-                      0 AS resolution_priority, 0 AS synonym_depth \
-               FROM ALL_OBJECTS o \
-               WHERE o.OWNER = {owner} \
-                 AND o.OBJECT_NAME = {table} \
-                 AND o.OBJECT_TYPE IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW') \
-               UNION ALL \
-               SELECT sc.resolved_owner, sc.resolved_table, \
-                      CASE WHEN sc.root_owner = {owner} THEN 1 ELSE 2 END AS resolution_priority, \
-                      sc.synonym_depth \
-               FROM synonym_chain sc \
-               JOIN ALL_OBJECTS o \
-                 ON o.OWNER = sc.resolved_owner \
-                AND o.OBJECT_NAME = sc.resolved_table \
-                AND o.OBJECT_TYPE IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW') \
-             ) \
-             ORDER BY resolution_priority, synonym_depth \
-           ) \
-           WHERE ROWNUM = 1 \
-         ) \
-         SELECT c.COLUMN_NAME, c.DATA_TYPE, c.NULLABLE, c.DATA_DEFAULT, \
+// Oracle 11g can spend about a minute evaluating SYS_CONTEXT inside the ALL_SYNONYMS START WITH clause.
+const ORACLE_CURRENT_SCHEMA_SQL: &str = "SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS CURRENT_SCHEMA FROM DUAL";
+const ORACLE_SYNONYM_MAX_DEPTH: usize = 16;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct OracleObjectRef {
+    owner: String,
+    name: String,
+}
+
+struct OracleSynonymResolver {
+    current: OracleObjectRef,
+    visited: HashSet<OracleObjectRef>,
+    depth: usize,
+}
+
+impl OracleSynonymResolver {
+    fn new(owner: String, name: String) -> Self {
+        let current = OracleObjectRef { owner, name };
+        Self { current: current.clone(), visited: HashSet::from([current]), depth: 0 }
+    }
+
+    fn current(&self) -> &OracleObjectRef {
+        &self.current
+    }
+
+    fn include_public_synonym(&self) -> bool {
+        self.depth == 0
+    }
+
+    fn can_follow(&self) -> bool {
+        self.depth < ORACLE_SYNONYM_MAX_DEPTH
+    }
+
+    fn follow(&mut self, target: OracleObjectRef) -> bool {
+        if !self.can_follow() || !self.visited.insert(target.clone()) {
+            return false;
+        }
+        self.current = target;
+        self.depth += 1;
+        true
+    }
+}
+
+fn oracle_current_schema_from_query_result(result: db::QueryResult) -> Result<String, String> {
+    let schema_index = result
+        .columns
+        .iter()
+        .position(|column| column.trim().eq_ignore_ascii_case("CURRENT_SCHEMA"))
+        .ok_or_else(|| "Oracle current schema query did not return CURRENT_SCHEMA".to_string())?;
+    let schema = result
+        .rows
+        .first()
+        .and_then(|row| row.get(schema_index))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Oracle current schema query returned an empty schema".to_string())?;
+    let schema = schema.trim();
+    if schema.is_empty() {
+        return Err("Oracle current schema query returned an empty schema".to_string());
+    }
+    Ok(schema.to_string())
+}
+
+#[cfg(test)]
+fn oracle_columns_sql(schema: &str, table: &str) -> Result<String, String> {
+    let schema = schema.trim();
+    if schema.is_empty() {
+        return Err("Oracle columns query requires a resolved schema".to_string());
+    }
+    oracle_columns_sql_for_resolved_owner(&schema.to_uppercase(), table)
+}
+
+fn oracle_columns_sql_for_resolved_owner(owner: &str, table: &str) -> Result<String, String> {
+    if owner.trim().is_empty() {
+        return Err("Oracle columns query requires a resolved schema".to_string());
+    }
+    let owner = sql_string(owner);
+    Ok(format!(
+        "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.NULLABLE, c.DATA_DEFAULT, \
          c.DATA_LENGTH, c.DATA_PRECISION, c.DATA_SCALE, c.COLUMN_ID, \
          CASE WHEN EXISTS ( \
            SELECT 1 \
@@ -1351,20 +1482,39 @@ fn oracle_columns_sql(schema: &str, table: &str) -> String {
              AND cm.COLUMN_NAME = c.COLUMN_NAME \
          ) AS COMMENTS \
          FROM ALL_TAB_COLUMNS c \
-         JOIN resolved_object ro \
-           ON ro.resolved_owner = c.OWNER AND ro.resolved_table = c.TABLE_NAME \
+         WHERE c.OWNER = {owner} \
+           AND c.TABLE_NAME = {table} \
          ORDER BY c.COLUMN_ID",
         table = sql_string(table),
-    )
+    ))
 }
 
-fn oracle_columns_owner_filter(schema: &str) -> String {
-    let schema = schema.trim();
-    if schema.is_empty() {
-        "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string()
-    } else {
-        sql_string(&schema.to_uppercase())
+fn oracle_synonym_target_sql(owner: &str, table: &str, include_public: bool) -> Result<String, String> {
+    if owner.trim().is_empty() {
+        return Err("Oracle synonym query requires a resolved schema".to_string());
     }
+    let owner = sql_string(owner);
+    let owner_filter =
+        if include_public { format!("s.OWNER IN ({owner}, 'PUBLIC')") } else { format!("s.OWNER = {owner}") };
+    Ok(format!(
+        "SELECT s.TABLE_OWNER, s.TABLE_NAME \
+         FROM ALL_SYNONYMS s \
+         WHERE s.SYNONYM_NAME = {} \
+           AND {owner_filter} \
+           AND s.DB_LINK IS NULL \
+         ORDER BY CASE WHEN s.OWNER = {owner} THEN 0 ELSE 1 END",
+        sql_string(table),
+    ))
+}
+
+fn oracle_synonym_target_from_query_result(result: db::QueryResult) -> Option<OracleObjectRef> {
+    let owner_index = result.columns.iter().position(|column| column.eq_ignore_ascii_case("TABLE_OWNER"))?;
+    let table_index = result.columns.iter().position(|column| column.eq_ignore_ascii_case("TABLE_NAME"))?;
+    let row = result.rows.first()?;
+    Some(OracleObjectRef {
+        owner: query_result_cell_string(row, owner_index)?,
+        name: query_result_cell_string(row, table_index)?,
+    })
 }
 
 fn oracle_column_type(data_type: &str, precision: Option<i32>, scale: Option<i32>, length: Option<i32>) -> String {
@@ -1423,19 +1573,67 @@ async fn oracle_columns_via_sql(
     client: &mut db::agent_driver::AgentDriverClient,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    let sql = oracle_columns_sql(schema, table);
-    let result = client
-        .execute_query_with_timeout::<db::QueryResult>(
-            agent_execute_query_params(
-                &sql,
-                if database.is_empty() { None } else { Some(database) },
-                if schema.is_empty() { None } else { Some(schema) },
-                QueryExecutionOptions { max_rows: Some(10_000), ..Default::default() },
-            ),
-            timeout_duration,
-        )
-        .await?;
-    Ok(deduplicate_column_infos(oracle_columns_from_query_result(result)))
+    let request_schema = (!schema.trim().is_empty()).then_some(schema);
+    let owner = if let Some(schema) = request_schema {
+        schema.trim().to_uppercase()
+    } else {
+        let result = client
+            .execute_query_with_timeout::<db::QueryResult>(
+                agent_execute_query_params(
+                    ORACLE_CURRENT_SCHEMA_SQL,
+                    if database.is_empty() { None } else { Some(database) },
+                    None,
+                    QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                ),
+                timeout_duration,
+            )
+            .await?;
+        oracle_current_schema_from_query_result(result)?
+    };
+    let mut resolver = OracleSynonymResolver::new(owner, table.to_string());
+
+    loop {
+        let object = resolver.current();
+        let sql = oracle_columns_sql_for_resolved_owner(&object.owner, &object.name)?;
+        let result = client
+            .execute_query_with_timeout::<db::QueryResult>(
+                agent_execute_query_params(
+                    &sql,
+                    if database.is_empty() { None } else { Some(database) },
+                    request_schema,
+                    QueryExecutionOptions { max_rows: Some(10_000), ..Default::default() },
+                ),
+                timeout_duration,
+            )
+            .await?;
+        let columns = oracle_columns_from_query_result(result);
+        if !columns.is_empty() {
+            return Ok(deduplicate_column_infos(columns));
+        }
+        if !resolver.can_follow() {
+            return Ok(Vec::new());
+        }
+
+        let object = resolver.current();
+        let sql = oracle_synonym_target_sql(&object.owner, &object.name, resolver.include_public_synonym())?;
+        let result = client
+            .execute_query_with_timeout::<db::QueryResult>(
+                agent_execute_query_params(
+                    &sql,
+                    if database.is_empty() { None } else { Some(database) },
+                    request_schema,
+                    QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                ),
+                timeout_duration,
+            )
+            .await?;
+        let Some(target) = oracle_synonym_target_from_query_result(result) else {
+            return Ok(Vec::new());
+        };
+        if !resolver.follow(target) {
+            return Ok(Vec::new());
+        }
+    }
 }
 
 async fn external_driver_oracle_columns_via_sql(
@@ -1445,30 +1643,77 @@ async fn external_driver_oracle_columns_via_sql(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    let result: db::QueryResult = session
-        .invoke_with_timeout(
-            "executeQuery",
-            serde_json::json!({
-                "connection": config,
-                "database": database,
-                "schema": schema,
-                "sql": oracle_columns_sql(schema, table),
-                "maxRows": 10_000
-            }),
-            agent_metadata_timeout(Some(config)),
-        )
-        .await?;
-    Ok(deduplicate_column_infos(oracle_columns_from_query_result(result)))
+    let request_schema = if schema.trim().is_empty() { "" } else { schema };
+    let owner = if request_schema.is_empty() {
+        let result: db::QueryResult = session
+            .invoke_with_timeout(
+                "executeQuery",
+                serde_json::json!({
+                    "connection": config,
+                    "database": database,
+                    "schema": request_schema,
+                    "sql": ORACLE_CURRENT_SCHEMA_SQL,
+                    "maxRows": 1
+                }),
+                agent_metadata_timeout(Some(config)),
+            )
+            .await?;
+        oracle_current_schema_from_query_result(result)?
+    } else {
+        schema.trim().to_uppercase()
+    };
+    let mut resolver = OracleSynonymResolver::new(owner, table.to_string());
+
+    loop {
+        let object = resolver.current();
+        let sql = oracle_columns_sql_for_resolved_owner(&object.owner, &object.name)?;
+        let result: db::QueryResult = session
+            .invoke_with_timeout(
+                "executeQuery",
+                serde_json::json!({
+                    "connection": config,
+                    "database": database,
+                    "schema": request_schema,
+                    "sql": sql,
+                    "maxRows": 10_000
+                }),
+                agent_metadata_timeout(Some(config)),
+            )
+            .await?;
+        let columns = oracle_columns_from_query_result(result);
+        if !columns.is_empty() {
+            return Ok(deduplicate_column_infos(columns));
+        }
+        if !resolver.can_follow() {
+            return Ok(Vec::new());
+        }
+
+        let object = resolver.current();
+        let sql = oracle_synonym_target_sql(&object.owner, &object.name, resolver.include_public_synonym())?;
+        let result: db::QueryResult = session
+            .invoke_with_timeout(
+                "executeQuery",
+                serde_json::json!({
+                    "connection": config,
+                    "database": database,
+                    "schema": request_schema,
+                    "sql": sql,
+                    "maxRows": 1
+                }),
+                agent_metadata_timeout(Some(config)),
+            )
+            .await?;
+        let Some(target) = oracle_synonym_target_from_query_result(result) else {
+            return Ok(Vec::new());
+        };
+        if !resolver.follow(target) {
+            return Ok(Vec::new());
+        }
+    }
 }
 
-fn should_query_oracle_columns_via_sql_first(
-    db_type: &DatabaseType,
-    schema: &str,
-    client_session_id: Option<&str>,
-) -> bool {
-    *db_type == DatabaseType::Oracle
-        && schema.trim().is_empty()
-        && client_session_id.is_some_and(|session_id| !session_id.trim().is_empty())
+fn should_query_oracle_columns_via_sql_first(db_type: &DatabaseType, client_session_id: Option<&str>) -> bool {
+    *db_type == DatabaseType::Oracle && client_session_id.is_some_and(|session_id| !session_id.trim().is_empty())
 }
 
 fn oracle_object_statistics_sql(schema: &str) -> String {
@@ -1613,6 +1858,28 @@ fn dameng_object_statistics_rows_only_sql(schema: &str) -> String {
          ORDER BY t.TABLE_NAME",
         oracle_owner_filter(schema),
     )
+}
+
+/// One attempt of an object-statistics fallback chain: a log label, the SQL to
+/// run, and whether an empty (but successful) result should be accepted instead
+/// of falling through to the next attempt.
+type ObjectStatisticsAttempt = (&'static str, String, bool);
+
+fn oracle_object_statistics_query_plan(schema: &str) -> Vec<ObjectStatisticsAttempt> {
+    vec![
+        ("all-segments", oracle_object_statistics_sql(schema), true),
+        ("dba-segments", oracle_object_statistics_dba_segments_sql(schema), true),
+        ("user-segments", oracle_object_statistics_user_segments_sql(schema), false),
+        ("rows-only", oracle_object_statistics_rows_only_sql(schema), true),
+    ]
+}
+
+fn dameng_object_statistics_query_plan(schema: &str) -> Vec<ObjectStatisticsAttempt> {
+    vec![
+        ("dba-segments", dameng_object_statistics_dba_segments_sql(schema), true),
+        ("user-segments", dameng_object_statistics_user_segments_sql(schema), false),
+        ("rows-only", dameng_object_statistics_rows_only_sql(schema), true),
+    ]
 }
 
 fn gbase8a_object_statistics_sql(database: &str) -> String {
@@ -1821,44 +2088,54 @@ async fn load_oracle_table_comments_for_objects(
     Ok(())
 }
 
+/// Runs an object-statistics fallback chain against an arbitrary query
+/// transport, so the agent drivers and generic JDBC connections
+/// (`PoolKind::ExternalDriver`) can share the same vendor SQL and the same
+/// "try the next catalog view" behaviour.
+async fn object_statistics_from_query_plan<F, Fut>(
+    vendor: &str,
+    schema: &str,
+    plan: Vec<ObjectStatisticsAttempt>,
+    mut run: F,
+) -> Result<Vec<db::ObjectStatistics>, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<db::QueryResult, String>>,
+{
+    let mut last_error = None;
+    for (source, sql, accept_empty) in plan {
+        match run(sql).await {
+            Ok(result) if accept_empty || !result.rows.is_empty() => {
+                return Ok(oracle_object_statistics_from_query_result(result));
+            }
+            Ok(_) => {
+                log::debug!("[schema][{vendor}:list_object_statistics:empty-fallback] schema={schema} source={source}");
+            }
+            Err(error) => {
+                log::debug!(
+                    "[schema][{vendor}:list_object_statistics:fallback-failed] schema={schema} source={source} error={error}"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("{vendor} object statistics are unavailable")))
+}
+
 async fn oracle_agent_list_object_statistics(
     client: Arc<db::agent_driver::PooledAgentClient>,
     database: &str,
     schema: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectStatistics>, String> {
-    let mut client = client.lock().await;
-    let queries = [
-        ("all-segments", oracle_object_statistics_sql(schema), true),
-        ("dba-segments", oracle_object_statistics_dba_segments_sql(schema), true),
-        ("user-segments", oracle_object_statistics_user_segments_sql(schema), false),
-        ("rows-only", oracle_object_statistics_rows_only_sql(schema), true),
-    ];
-    let mut last_error = None;
-    for (source, sql, accept_empty) in queries {
-        match agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await {
-            Ok(result) if accept_empty || !result.rows.is_empty() => {
-                return Ok(oracle_object_statistics_from_query_result(result));
-            }
-            Ok(_) => {
-                log::debug!(
-                    "[schema][oracle:list_object_statistics:empty-fallback] schema={} source={}",
-                    schema,
-                    source
-                );
-            }
-            Err(error) => {
-                log::debug!(
-                    "[schema][oracle:list_object_statistics:fallback-failed] schema={} source={} error={}",
-                    schema,
-                    source,
-                    error
-                );
-                last_error = Some(error);
-            }
+    object_statistics_from_query_plan("Oracle", schema, oracle_object_statistics_query_plan(schema), |sql| {
+        let client = client.clone();
+        async move {
+            let mut client = client.lock().await;
+            agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await
         }
-    }
-    Err(last_error.unwrap_or_else(|| "Oracle object statistics are unavailable".to_string()))
+    })
+    .await
 }
 
 async fn dameng_agent_list_object_statistics(
@@ -1867,37 +2144,14 @@ async fn dameng_agent_list_object_statistics(
     schema: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectStatistics>, String> {
-    let mut client = client.lock().await;
-    let queries = [
-        ("dba-segments", dameng_object_statistics_dba_segments_sql(schema), true),
-        ("user-segments", dameng_object_statistics_user_segments_sql(schema), false),
-        ("rows-only", dameng_object_statistics_rows_only_sql(schema), true),
-    ];
-    let mut last_error = None;
-    for (source, sql, accept_empty) in queries {
-        match agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await {
-            Ok(result) if accept_empty || !result.rows.is_empty() => {
-                return Ok(oracle_object_statistics_from_query_result(result));
-            }
-            Ok(_) => {
-                log::debug!(
-                    "[schema][dameng:list_object_statistics:empty-fallback] schema={} source={}",
-                    schema,
-                    source
-                );
-            }
-            Err(error) => {
-                log::debug!(
-                    "[schema][dameng:list_object_statistics:fallback-failed] schema={} source={} error={}",
-                    schema,
-                    source,
-                    error
-                );
-                last_error = Some(error);
-            }
+    object_statistics_from_query_plan("Dameng", schema, dameng_object_statistics_query_plan(schema), |sql| {
+        let client = client.clone();
+        async move {
+            let mut client = client.lock().await;
+            agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await
         }
-    }
-    Err(last_error.unwrap_or_else(|| "Dameng object statistics are unavailable".to_string()))
+    })
+    .await
 }
 
 async fn agent_list_object_statistics(
@@ -1910,6 +2164,101 @@ async fn agent_list_object_statistics(
     let mut client = client.lock().await;
     let result = agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await?;
     Ok(oracle_object_statistics_from_query_result(result))
+}
+
+/// Vendors whose object statistics can be collected over a generic JDBC
+/// connection (`PoolKind::ExternalDriver`).
+///
+/// The bundled JDBC plugin exposes no `listObjectStatistics` RPC, but the
+/// vendor statistics SQL is plain SQL that runs fine through `executeQuery`, so
+/// the only missing piece is recognising which database sits behind the JDBC
+/// URL. The prefixes mirror `DbxJdbcPlugin.driverQuirks`, which picks its own
+/// metadata dialect the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExternalDriverStatisticsDialect {
+    Oracle,
+    Dameng,
+    Kingbase,
+}
+
+fn external_driver_statistics_dialect(config: &ConnectionConfig) -> Option<ExternalDriverStatisticsDialect> {
+    // `is_oracle_external_driver_config` (added alongside the JDBC Oracle DDL
+    // fix) checks both the `jdbc:oracle:` URL prefix and the driver class, so
+    // it recognises more real-world configs than a URL-only sniff would.
+    if config.db_type == DatabaseType::Oracle || is_oracle_external_driver_config(config) {
+        return Some(ExternalDriverStatisticsDialect::Oracle);
+    }
+    match config.db_type {
+        DatabaseType::Dameng => return Some(ExternalDriverStatisticsDialect::Dameng),
+        DatabaseType::Kingbase => return Some(ExternalDriverStatisticsDialect::Kingbase),
+        // Generic JDBC connections carry no vendor in `db_type`; sniff the URL.
+        DatabaseType::Jdbc => {}
+        _ => return None,
+    }
+    let url = config.connection_string.as_deref().map(str::trim).filter(|url| !url.is_empty())?.to_ascii_lowercase();
+    if url.starts_with("jdbc:dm:") {
+        Some(ExternalDriverStatisticsDialect::Dameng)
+    } else if url.starts_with("jdbc:kingbase") {
+        Some(ExternalDriverStatisticsDialect::Kingbase)
+    } else {
+        None
+    }
+}
+
+fn external_driver_statistics_query_plan(
+    dialect: ExternalDriverStatisticsDialect,
+    schema: &str,
+) -> Vec<ObjectStatisticsAttempt> {
+    match dialect {
+        ExternalDriverStatisticsDialect::Oracle => oracle_object_statistics_query_plan(schema),
+        ExternalDriverStatisticsDialect::Dameng => dameng_object_statistics_query_plan(schema),
+        ExternalDriverStatisticsDialect::Kingbase => {
+            vec![("catalog", kingbase::object_statistics_sql(schema), true)]
+        }
+    }
+}
+
+fn external_driver_statistics_vendor(dialect: ExternalDriverStatisticsDialect) -> &'static str {
+    match dialect {
+        ExternalDriverStatisticsDialect::Oracle => "Oracle",
+        ExternalDriverStatisticsDialect::Dameng => "Dameng",
+        ExternalDriverStatisticsDialect::Kingbase => "Kingbase",
+    }
+}
+
+async fn external_driver_list_object_statistics(
+    session: Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    dialect: ExternalDriverStatisticsDialect,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectStatistics>, String> {
+    let timeout_duration = agent_metadata_timeout(Some(config));
+    object_statistics_from_query_plan(
+        external_driver_statistics_vendor(dialect),
+        schema,
+        external_driver_statistics_query_plan(dialect, schema),
+        |sql| {
+            let session = session.clone();
+            async move {
+                session
+                    .invoke_with_timeout(
+                        "executeQuery",
+                        serde_json::json!({
+                            "connection": config,
+                            "database": database,
+                            "schema": schema,
+                            "sql": sql,
+                            "maxRows": 10_000,
+                            "fetchSize": 1000,
+                        }),
+                        timeout_duration,
+                    )
+                    .await
+            }
+        },
+    )
+    .await
 }
 
 async fn agent_object_statistics_query(
@@ -1982,11 +2331,11 @@ async fn list_tables_once(
     }
 
     {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(PoolKind::ExternalDriver { driver_id, config, session }) = pool_handle.as_ref() {
+            let driver_id = driver_id.clone();
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             if uses_presto_like_information_schema_tables(&config.db_type) {
                 let force_local_table_name_filter = table_name_filter.is_some_and(|filter| !filter.is_empty());
                 return external_driver_presto_like_tables(
@@ -2009,6 +2358,12 @@ async fn list_tables_once(
             if let Some(object_types) = object_types {
                 params["object_types"] = serde_json::json!(object_types);
             }
+            if let Some(limit) = limit {
+                params["limit"] = serde_json::json!(limit);
+            }
+            if let Some(offset) = offset {
+                params["offset"] = serde_json::json!(offset);
+            }
             return session
                 .invoke_with_timeout::<Vec<db::TableInfo>>(
                     "listTables",
@@ -2016,39 +2371,57 @@ async fn list_tables_once(
                     agent_metadata_timeout(Some(config.as_ref())),
                 )
                 .await
-                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
+                .map(|tables| {
+                    let final_offset = if external_driver_paging_likely_applied(&driver_id, limit, tables.len()) {
+                        Some(0)
+                    } else {
+                        offset
+                    };
+                    filter_table_infos(tables, filter, limit, final_offset, object_types, table_name_filter)
+                });
         }
         #[cfg(feature = "duckdb-sidecar")]
-        if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), DuckDbWorker) {
             let database = database.to_string();
             let schema = schema.to_string();
-            drop(connections);
             return client
                 .list_tables(database, schema)
                 .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), ClickHouse) {
+            if requests_table_objects_only(object_types) && table_name_filter.is_none_or(TableNameFilter::is_empty) {
+                return db::clickhouse_driver::list_table_objects_filtered(
+                    &client,
+                    clickhouse_metadata_database(database, schema),
+                    filter,
+                    limit,
+                    offset,
+                )
+                .await
+                .map(|tables| filter_table_infos(tables, None, None, None, object_types, None));
+            }
             return db::clickhouse_driver::list_tables(&client, clickhouse_metadata_database(database, schema))
                 .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, InfluxDb) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), InfluxDb) {
             return db::influxdb_driver::list_tables(&client, database)
                 .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, VictoriaMetrics) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), InfluxDb3) {
+            return db::influxdb3_driver::list_tables(&client, database)
+                .await
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
+        }
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), VictoriaMetrics) {
             return db::victoriametrics_driver::list_tables(&client)
                 .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
         }
         if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
-            if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-                drop(connections);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
                 let mut client = lock_sqlserver_metadata_client(&client).await?;
                 return db::sqlserver::list_linked_server_tables(
                     &mut client,
@@ -2063,17 +2436,22 @@ async fn list_tables_once(
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
             }
         }
+        if requests_table_objects_only(object_types) && table_name_filter.is_none_or(TableNameFilter::is_empty) {
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
+                let mut client = lock_sqlserver_metadata_client(&client).await?;
+                return db::sqlserver::list_table_objects(&mut client, schema, filter, limit, offset).await;
+            }
+        }
         if object_types.is_some() || table_name_filter.is_some_and(|filter| !filter.is_empty()) {
-            if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-                drop(connections);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
                 let mut client = lock_sqlserver_metadata_client(&client).await?;
                 return db::sqlserver::list_tables(&mut client, schema, filter, None, None)
                     .await
                     .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
             }
         }
-        try_sqlserver!(connections, &pool_key, list_tables, schema, filter, limit, offset);
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+        try_sqlserver!(pool_handle, list_tables, schema, filter, limit, offset);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let use_mongodb_collection_listing = uses_mongodb_agent_collection_listing(db_config.as_ref());
             let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
             let is_tdengine = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Tdengine);
@@ -2086,7 +2464,6 @@ async fn list_tables_once(
                 filter_locally_after_oracle_comments || filter_locally_after_tdengine_comments;
             let timeout_duration = agent_metadata_timeout(db_config.as_ref());
             let fallback_config = db_config.clone();
-            drop(connections);
             let mut client = client.lock().await;
             if use_mongodb_collection_listing {
                 let collection_names = client.mongo_list_collections::<Vec<String>>(database).await?;
@@ -2273,6 +2650,11 @@ async fn list_tables_once(
                 .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter))
         }
+        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(db::oceanbase_mysql::is_config) => {
+            db::oceanbase_mysql::list_tables(p, mysql_table_metadata_catalog(database, schema))
+                .await
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter))
+        }
         PoolKind::Mysql(p, mode) => {
             if *mode == MysqlMode::OceanBaseOracle {
                 let tables = db::ob_oracle::list_tables(p, schema).await?;
@@ -2310,7 +2692,9 @@ async fn list_tables_once(
             }
         }
         PoolKind::Postgres(p) => {
-            if object_types.is_some() || table_name_filter.is_some_and(|filter| !filter.is_empty()) {
+            if requests_table_objects_only(object_types) && table_name_filter.is_none_or(TableNameFilter::is_empty) {
+                db::postgres::list_table_objects_filtered(p, schema, filter, limit, offset).await
+            } else if object_types.is_some() || table_name_filter.is_some_and(|filter| !filter.is_empty()) {
                 db::postgres::list_tables_filtered(p, schema, filter, None, None)
                     .await
                     .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter))
@@ -2415,6 +2799,7 @@ fn filter_object_infos(
     limit: Option<usize>,
     offset: Option<usize>,
     object_types: Option<&[String]>,
+    table_name_filter: Option<&TableNameFilter>,
 ) -> Vec<db::ObjectInfo> {
     let filter = filter.unwrap_or("");
     let limit = limit.unwrap_or(usize::MAX);
@@ -2422,6 +2807,7 @@ fn filter_object_infos(
     objects
         .into_iter()
         .filter(|object| metadata_name_or_comment_matches(&object.name, object.comment.as_deref(), filter))
+        .filter(|object| table_name_filter_matches(&object.name, table_name_filter))
         .filter(|object| object_info_matches_object_types(object, object_types))
         .skip(offset)
         .take(limit)
@@ -2487,6 +2873,10 @@ fn normalize_table_info_object_type(value: &str) -> String {
         return "INDEX".to_string();
     }
     "TABLE".to_string()
+}
+
+fn requests_table_objects_only(object_types: Option<&[String]>) -> bool {
+    object_types.is_some_and(|types| types.len() == 1 && normalize_table_info_object_type(&types[0]) == "TABLE")
 }
 
 fn uses_presto_like_information_schema_tables(db_type: &DatabaseType) -> bool {
@@ -2765,38 +3155,114 @@ fn escape_presto_like_pattern(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::agent_postgres_extension_fallback_config;
     use super::db;
     use super::{
         clickhouse_metadata_database, dameng_object_statistics_dba_segments_sql,
         dameng_object_statistics_rows_only_sql, dameng_object_statistics_user_segments_sql, deduplicate_column_infos,
-        ephemeral_agent_metadata_session_id, external_driver_uses_mysql_ddl, filter_mongodb_agent_collections,
+        ephemeral_agent_metadata_session_id, external_driver_statistics_dialect, external_driver_statistics_query_plan,
+        external_driver_uses_generic_ddl, external_driver_uses_mysql_ddl, filter_mongodb_agent_collections,
         filter_mysql_system_databases_for_config, filter_object_infos, filter_table_infos, filter_visible_schema_names,
         finalize_object_source, gaussdb_m_view_object_source_sql, gbase8a_object_statistics_sql,
-        is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config, is_retryable_metadata_error,
-        metadata_error_action, metadata_name_or_comment_matches, mysql_database_list_timeout,
-        mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
+        is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config, is_oracle_external_driver_config,
+        is_retryable_metadata_error, metadata_error_action, metadata_name_or_comment_matches,
+        mysql_database_list_timeout, mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
         mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_list_source_for_config,
         mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
-        oracle_columns_sql, oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
+        oracle_columns_sql, oracle_columns_sql_for_resolved_owner, oracle_current_schema_from_query_result,
+        oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
         oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
-        oracle_object_statistics_user_segments_sql, oracle_table_comment_from_query_result, oracle_table_comment_sql,
-        oracle_table_comments_sql, presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
-        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result, replace_metadata_runtime,
+        oracle_object_statistics_user_segments_sql, oracle_synonym_target_from_query_result, oracle_synonym_target_sql,
+        oracle_table_comment_from_query_result, oracle_table_comment_sql, oracle_table_comments_sql,
+        presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
+        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
+        reference_key_columns_from_indexes, reference_keys_from_indexes, replace_metadata_runtime,
         should_query_oracle_columns_via_sql_first, table_comments_from_query_result, table_name_filter_matches,
         tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
-        uses_mongodb_agent_collection_listing, visible_schema_filter, MetadataErrorAction, MysqlTableListSource,
-        TableNameFilter, TDENGINE_COMMENT_SEARCH_TIMEOUT, TDENGINE_LIKE_PATTERN_MAX_BYTES,
+        uses_mongodb_agent_collection_listing, visible_schema_filter, ExternalDriverStatisticsDialect,
+        MetadataErrorAction, MysqlTableListSource, OracleObjectRef, OracleSynonymResolver, ReferenceKeyInfo,
+        TableNameFilter, ORACLE_CURRENT_SCHEMA_SQL, ORACLE_SYNONYM_MAX_DEPTH, TDENGINE_COMMENT_SEARCH_TIMEOUT,
+        TDENGINE_LIKE_PATTERN_MAX_BYTES,
     };
     use super::{list_databases_core, list_tables_core};
     use super::{
         object_types_include_custom_types, object_types_include_relations, object_types_include_routines,
         object_types_only_custom_types, supports_custom_type_details, supports_pg_custom_type_objects,
     };
+
     use crate::connection::{AppState, PoolKind};
     use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
+    #[cfg(unix)]
+    use crate::plugins::{
+        InstalledPlugin, PluginDriverManifest, PluginDriverSession, PluginManifest, PluginRuntimeEnv,
+    };
     use crate::storage::Storage;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    #[test]
+    fn reference_keys_require_effective_unfiltered_plain_unique_columns() {
+        let index = |name: &str, columns: &[&str], is_unique: bool, is_primary: bool| db::IndexInfo {
+            name: name.to_string(),
+            columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            is_unique,
+            is_primary,
+            filter: None,
+            index_type: None,
+            included_columns: None,
+            comment: None,
+            key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        };
+        let mut filtered = index("uq_active_code", &["active_code"], true, false);
+        filtered.filter = Some("active = true".to_string());
+        let mut expression = index("uq_lower_email", &["lower(email)"], true, false);
+        expression.key_is_expression = vec![true];
+        let mut composite_expression = index("uq_tenant_lower_code", &["tenant_id", "lower(code)"], true, false);
+        composite_expression.key_is_expression = vec![false, true];
+        let indexes = vec![
+            index("clickhouse_primary", &["event_id"], false, true),
+            index("uq_code", &["code"], true, false),
+            index("uq_Code", &["Code"], true, false),
+            index("uq_tenant_code", &["tenant_id", "code"], true, false),
+            index("uq_tenant_code_duplicate", &["tenant_id", "code"], true, false),
+            index("uq_empty", &[""], true, false),
+            index("uq_repeated", &["tenant_id", "tenant_id"], true, false),
+            filtered,
+            expression,
+            composite_expression,
+        ];
+
+        assert_eq!(
+            reference_keys_from_indexes(&indexes),
+            vec![
+                ReferenceKeyInfo { columns: vec!["code".to_string()] },
+                ReferenceKeyInfo { columns: vec!["Code".to_string()] },
+                ReferenceKeyInfo { columns: vec!["tenant_id".to_string(), "code".to_string()] },
+            ]
+        );
+        assert_eq!(reference_key_columns_from_indexes(&indexes), vec!["code", "Code"]);
+    }
+
+    fn oracle_current_schema_result(columns: &[&str], rows: Vec<Vec<serde_json::Value>>) -> db::QueryResult {
+        db::QueryResult {
+            columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            column_types: Vec::new(),
+            column_sortables: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows,
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        }
+    }
 
     async fn spawn_turso_table_server() -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2866,7 +3332,11 @@ mod tests {
         config.host = base_url.to_string();
         state.configs.write().await.insert(config.id.clone(), config);
         let client = db::turso_driver::TursoClient::new(base_url, "test-token", false, Duration::from_secs(2)).unwrap();
-        state.connections.write().await.insert("test".to_string(), PoolKind::Turso(client));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("test".to_string(), PoolKind::Turso(client));
+            })
+            .await;
         (state, dir)
     }
 
@@ -2906,6 +3376,7 @@ mod tests {
             database: Some("demo".to_string()),
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -2933,10 +3404,16 @@ mod tests {
             redis_key_separator: crate::models::connection::default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: HashMap::new(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -3100,6 +3577,9 @@ mod tests {
         config.connection_string = Some(" jdbc:mysql://127.0.0.1:3306/demo ".to_string());
         assert!(is_mysql_external_driver_config(&config));
 
+        config.jdbc_driver_class = Some("com.example.AoeMysqlDriver".to_string());
+        assert!(!is_mysql_external_driver_config(&config));
+
         config.connection_string = Some("jdbc:mariadb://127.0.0.1:3306/demo".to_string());
         config.jdbc_driver_class = Some("com.mysql.cj.jdbc.Driver".to_string());
         assert!(!is_mysql_external_driver_config(&config));
@@ -3109,6 +3589,188 @@ mod tests {
 
         config.jdbc_driver_class = Some("org.mariadb.jdbc.Driver".to_string());
         assert!(!is_mysql_external_driver_config(&config));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mysql_external_driver_ddl_falls_back_to_generic_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-mysql-wrapper-ddl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("plugin.sh");
+        let calls = dir.join("calls.log");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  case "$line" in
+    *'"method":"executeQuery"'*)
+      echo executeQuery >> '{}'
+      printf '{{"id":%s,"error":{{"message":"SHOW CREATE TABLE is not supported"}}}}\n' "$id"
+      ;;
+    *'"method":"getObjectSource"'*)
+      echo getObjectSource >> '{}'
+      printf '{{"id":%s,"result":{{"source":"CREATE TABLE fallback_ddl"}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let plugin = InstalledPlugin {
+            manifest: PluginManifest {
+                id: "jdbc".to_string(),
+                name: "JDBC".to_string(),
+                version: "test".to_string(),
+                protocol_version: 1,
+                description: String::new(),
+                executable: Some("plugin.sh".to_string()),
+                drivers: vec![PluginDriverManifest {
+                    id: "jdbc".to_string(),
+                    label: "JDBC".to_string(),
+                    kind: "external".to_string(),
+                    database_type: Some("jdbc".to_string()),
+                }],
+                ..PluginManifest::default()
+            },
+            path: dir.clone(),
+            compatibility: crate::plugins::PluginCompatibility {
+                compatible: true,
+                backend_executable: Some(dir.join("plugin.sh")),
+                ..Default::default()
+            },
+        };
+        let session = std::sync::Arc::new(
+            PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default()).await.unwrap(),
+        );
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.id = "mysql-wrapper".to_string();
+        config.database = Some("demo".to_string());
+        config.connection_string = Some("jdbc:mysql://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = Some("com.example.AoeMysqlDriver".to_string());
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "mysql-wrapper".to_string(),
+                    PoolKind::ExternalDriver {
+                        driver_id: "jdbc".to_string(),
+                        config: std::sync::Arc::new(config),
+                        session,
+                    },
+                );
+            })
+            .await;
+
+        let ddl = super::get_table_ddl_core(&state, "mysql-wrapper", "demo", "", "orders", None)
+            .await
+            .expect("generic DDL should be returned after SHOW CREATE TABLE fails");
+
+        assert_eq!(ddl, "CREATE TABLE fallback_ddl");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "executeQuery\ngetObjectSource\n");
+
+        state.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oracle_external_driver_detection_only_accepts_standard_jdbc_signals() {
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some(" jdbc:oracle:thin:@//127.0.0.1:1521/ORCL ".to_string());
+        assert!(is_oracle_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:postgresql://127.0.0.1:5432/demo".to_string());
+        config.jdbc_driver_class = Some("oracle.jdbc.OracleDriver".to_string());
+        assert!(!is_oracle_external_driver_config(&config));
+
+        config.connection_string = None;
+        config.jdbc_driver_class = Some(" oracle.jdbc.driver.OracleDriver ".to_string());
+        assert!(is_oracle_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:oracle:thin:@//127.0.0.1:1521/ORCL".to_string());
+        config.jdbc_driver_class = Some("com.mysql.cj.jdbc.Driver".to_string());
+        assert!(!is_oracle_external_driver_config(&config));
+
+        config.db_type = DatabaseType::Oracle;
+        assert!(!is_oracle_external_driver_config(&config));
+    }
+
+    #[test]
+    fn external_driver_generic_ddl_applies_to_unmatched_jdbc_connections() {
+        // JDBCX-style wrappers match no vendor DDL dialect and fall back to the
+        // plugin's generic DatabaseMetaData renderer.
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some("jdbcx:wrap-jdbc:jdbc:mysql://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = Some("io.github.jdbcx.WrappedDriver".to_string());
+        assert!(external_driver_uses_generic_ddl(&config));
+        assert!(!external_driver_uses_mysql_ddl(&config));
+        assert!(!is_oracle_external_driver_config(&config));
+
+        // Vendor dialects keep their dedicated SQL paths.
+        config.connection_string = Some("jdbc:mysql://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = None;
+        assert!(!external_driver_uses_generic_ddl(&config));
+
+        config.connection_string = Some("jdbc:oracle:thin:@//127.0.0.1:1521/ORCL".to_string());
+        assert!(!external_driver_uses_generic_ddl(&config));
+
+        // Vendor-typed database never routes through the generic renderer.
+        let oracle = test_connection_config(DatabaseType::Oracle);
+        assert!(!external_driver_uses_generic_ddl(&oracle));
+    }
+
+    #[test]
+    fn external_driver_statistics_dialect_matches_jdbc_url_vendor() {
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some(" JDBC:Oracle:thin:@127.0.0.1:1521:XE ".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), Some(ExternalDriverStatisticsDialect::Oracle));
+
+        config.connection_string = Some("jdbc:dm://127.0.0.1:5236".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), Some(ExternalDriverStatisticsDialect::Dameng));
+
+        config.connection_string = Some("jdbc:kingbase8://127.0.0.1:54321/app".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), Some(ExternalDriverStatisticsDialect::Kingbase));
+
+        // Vendors without statistics SQL keep the previous "no statistics" behaviour.
+        config.connection_string = Some("jdbc:hive2://127.0.0.1:10000/default".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), None);
+
+        config.connection_string = None;
+        assert_eq!(external_driver_statistics_dialect(&config), None);
+
+        // A vendor-typed connection routed through an external driver keeps its dialect.
+        let oracle = test_connection_config(DatabaseType::Oracle);
+        assert_eq!(external_driver_statistics_dialect(&oracle), Some(ExternalDriverStatisticsDialect::Oracle));
+    }
+
+    #[test]
+    fn external_driver_statistics_query_plan_reuses_vendor_sql() {
+        let oracle = external_driver_statistics_query_plan(ExternalDriverStatisticsDialect::Oracle, "dbx_test");
+        assert_eq!(
+            oracle.iter().map(|(source, ..)| *source).collect::<Vec<_>>(),
+            vec!["all-segments", "dba-segments", "user-segments", "rows-only"]
+        );
+        assert_eq!(oracle[0].1, oracle_object_statistics_sql("dbx_test"));
+        assert!(oracle[0].1.contains("t.OWNER = 'DBX_TEST'"));
+
+        let dameng = external_driver_statistics_query_plan(ExternalDriverStatisticsDialect::Dameng, "dbx_test");
+        assert_eq!(dameng[0].1, dameng_object_statistics_dba_segments_sql("dbx_test"));
+
+        let kingbase = external_driver_statistics_query_plan(ExternalDriverStatisticsDialect::Kingbase, "public");
+        assert_eq!(kingbase.len(), 1);
+        assert!(kingbase[0].1.contains("sys_catalog.sys_class"));
     }
 
     #[test]
@@ -3483,13 +4145,18 @@ mod tests {
         let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
         let state = crate::connection::AppState::new(storage);
         let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
-        state.connections.write().await.insert("conn".to_string(), super::PoolKind::Sqlite(pool));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("conn".to_string(), super::PoolKind::Sqlite(pool));
+            })
+            .await;
 
         let snapshot = super::clone_metadata_pool(&state, "conn").await.expect("metadata pool snapshot");
-        let write_guard = state.connections.try_write().expect("snapshot must not retain the global pool-map lock");
+        tokio::time::timeout(std::time::Duration::from_millis(100), state.update_connection_pools(|_| ()))
+            .await
+            .expect("snapshot must not retain the global pool-map lock");
 
         assert!(matches!(snapshot, super::PoolKind::Sqlite(_)));
-        drop(write_guard);
         drop(snapshot);
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
@@ -3522,14 +4189,18 @@ mod tests {
         let mut config = test_connection_config(DatabaseType::Dameng);
         config.id = "conn".to_string();
         state.configs.write().await.insert(config.id.clone(), config);
-        state.connections.write().await.insert(
-            "conn:analytics:role:metadata".to_string(),
-            super::PoolKind::agent(crate::db::agent_driver::AgentDriverClient::test_stub()),
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "conn:analytics:role:metadata".to_string(),
+                    super::PoolKind::agent(crate::db::agent_driver::AgentDriverClient::test_stub()),
+                );
+            })
+            .await;
 
         replace_metadata_runtime(&state, "conn", Some("analytics"), None).await;
 
-        assert!(!state.connections.read().await.contains_key("conn:analytics:role:metadata"));
+        assert!(state.pool_handle("conn:analytics:role:metadata").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3543,7 +4214,11 @@ mod tests {
         config.id = "conn".to_string();
         state.configs.write().await.insert(config.id.clone(), config);
         let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
-        state.connections.write().await.insert("conn:role:metadata".to_string(), super::PoolKind::Sqlite(pool));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("conn:role:metadata".to_string(), super::PoolKind::Sqlite(pool));
+            })
+            .await;
         let mut attempts = 0;
 
         let result = super::retry_metadata_connection_for_session(&state, "conn", None, None, || {
@@ -3554,7 +4229,7 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), "Agent RPC call timed out (30s)");
         assert_eq!(attempts, 1);
-        assert!(!state.connections.read().await.contains_key("conn:role:metadata"));
+        assert!(state.pool_handle("conn:role:metadata").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3571,7 +4246,11 @@ mod tests {
         config.database = None;
         state.configs.write().await.insert(config.id.clone(), config);
         let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
-        state.connections.write().await.insert("conn".to_string(), super::PoolKind::Sqlite(pool));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("conn".to_string(), super::PoolKind::Sqlite(pool));
+            })
+            .await;
         let mut attempts = 0;
         let quarantine = "Agent RPC error (-1): connection lost\nDBX_AGENT_ERROR_DATA:{\"category\":\"connection\",\"sessionDisposition\":\"quarantine\"}";
 
@@ -3583,7 +4262,7 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), quarantine);
         assert_eq!(attempts, 2);
-        assert!(!state.connections.read().await.contains_key("conn"));
+        assert!(state.pool_handle("conn").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3646,7 +4325,11 @@ for line in sys.stdin:
         config.id = "conn".to_string();
         state.configs.write().await.insert(config.id.clone(), config);
         let pool_key = "conn:analytics:role:metadata";
-        state.connections.write().await.insert(pool_key.to_string(), super::PoolKind::agent(client));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(pool_key.to_string(), super::PoolKind::agent(client));
+            })
+            .await;
 
         let error = super::get_table_ddl_core(&state, "conn", "analytics", "APP", "EVENTS", None).await.unwrap_err();
 
@@ -3655,7 +4338,7 @@ for line in sys.stdin:
             Some(crate::db::agent_driver::AgentErrorCategory::Timeout)
         );
         assert_eq!(std::fs::read_to_string(call_count_path).unwrap(), "1");
-        assert!(!state.connections.read().await.contains_key(pool_key));
+        assert!(state.pool_handle(pool_key).await.is_none());
         runtime.kill();
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3690,6 +4373,20 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn oracle_metadata_object_source_is_limited_to_supported_kinds() {
+        let oracle = test_connection_config(DatabaseType::Oracle);
+        let postgres = test_connection_config(DatabaseType::Postgres);
+
+        for object_type in
+            [db::ObjectSourceKind::Sequence, db::ObjectSourceKind::Package, db::ObjectSourceKind::PackageBody]
+        {
+            assert!(super::uses_oracle_metadata_object_source(Some(&oracle), &object_type));
+        }
+        assert!(!super::uses_oracle_metadata_object_source(Some(&postgres), &db::ObjectSourceKind::Sequence,));
+        assert!(!super::uses_oracle_metadata_object_source(Some(&oracle), &db::ObjectSourceKind::View,));
+    }
+
+    #[test]
     fn agent_table_paging_supports_tdengine_and_default_oracle_only() {
         assert!(super::supports_agent_table_paging(&test_connection_config(DatabaseType::Tdengine)));
         assert!(super::supports_agent_table_paging(&test_connection_config(DatabaseType::Oracle)));
@@ -3698,6 +4395,20 @@ for line in sys.stdin:
         let mut legacy_oracle = test_connection_config(DatabaseType::Oracle);
         legacy_oracle.driver_profile = Some("oracle-legacy".to_string());
         assert!(!super::supports_agent_table_paging(&legacy_oracle));
+    }
+
+    #[test]
+    fn detects_opengauss_constraint_profiles_without_gaussdb() {
+        assert!(super::is_opengauss_constraint_config(&test_connection_config(DatabaseType::OpenGauss)));
+        assert!(!super::is_opengauss_constraint_config(&test_connection_config(DatabaseType::Gaussdb)));
+        assert!(!super::is_opengauss_constraint_config(&test_connection_config(DatabaseType::Postgres)));
+
+        let mut profiled_postgres = test_connection_config(DatabaseType::Postgres);
+        profiled_postgres.driver_profile = Some("opengauss".to_string());
+        assert!(super::is_opengauss_constraint_config(&profiled_postgres));
+
+        profiled_postgres.driver_profile = Some("gaussdb".to_string());
+        assert!(!super::is_opengauss_constraint_config(&profiled_postgres));
     }
 
     #[test]
@@ -3721,6 +4432,15 @@ for line in sys.stdin:
         assert!(!super::agent_paging_likely_applied(true, Some(500), 501));
         assert!(!super::agent_paging_likely_applied(false, Some(500), 120));
         assert!(!super::agent_paging_likely_applied(true, None, 120));
+    }
+
+    #[test]
+    fn external_driver_paging_detection_avoids_double_offset_for_jdbc_only() {
+        assert!(super::external_driver_paging_likely_applied("jdbc", Some(500), 500));
+        assert!(super::external_driver_paging_likely_applied("jdbc", Some(500), 120));
+        assert!(!super::external_driver_paging_likely_applied("jdbc", Some(500), 501));
+        assert!(!super::external_driver_paging_likely_applied("jdbc", None, 120));
+        assert!(!super::external_driver_paging_likely_applied("other", Some(500), 120));
     }
 
     #[test]
@@ -3865,6 +4585,7 @@ for line in sys.stdin:
     #[test]
     fn shardingsphere_proxy_marker_is_ascii_case_insensitive_and_exact() {
         assert!(super::is_shardingsphere_proxy_version("5.7.22-ShardingSphere-Proxy 5.5.2"));
+        assert!(super::is_shardingsphere_proxy_version("8.0.27-ShardingSphere-Proxy 5.5.2"));
         assert!(super::is_shardingsphere_proxy_version("8.0.36-SHARDINGSPHERE-PROXY 5.5.2"));
         assert!(!super::is_shardingsphere_proxy_version("8.0.36-ShardingSphere Proxy 5.5.2"));
         assert!(!super::is_shardingsphere_proxy_version("8.0.36-MySQL Community Server"));
@@ -4084,6 +4805,26 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn filter_object_infos_applies_sql_like_name_filter() {
+        let objects = vec![
+            test_object_info("fn_get_user", "FUNCTION"),
+            test_object_info("fn_get_role", "FUNCTION"),
+            test_object_info("fn_get_role_bak", "FUNCTION"),
+            test_object_info("internal_hash", "FUNCTION"),
+        ];
+        let object_types = vec!["FUNCTION".to_string()];
+        let name_filter =
+            TableNameFilter { include_patterns: vec!["FN_%".to_string()], exclude_patterns: vec!["%_BAK".to_string()] };
+
+        let filtered = filter_object_infos(objects, None, None, None, Some(&object_types), Some(&name_filter));
+
+        assert_eq!(
+            filtered.into_iter().map(|object| object.name).collect::<Vec<_>>(),
+            vec!["fn_get_user", "fn_get_role"]
+        );
+    }
+
+    #[test]
     fn filter_object_infos_filters_object_type_before_offset_and_limit() {
         let objects = vec![
             test_object_info("sync_user", "PROCEDURE"),
@@ -4093,7 +4834,7 @@ for line in sys.stdin:
         ];
         let object_types = vec!["FUNCTION".to_string()];
 
-        let filtered = filter_object_infos(objects, Some("fn"), Some(1), Some(1), Some(&object_types));
+        let filtered = filter_object_infos(objects, Some("fn"), Some(1), Some(1), Some(&object_types), None);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "fetch_name");
@@ -4109,7 +4850,7 @@ for line in sys.stdin:
         ];
         let object_types = vec!["MATERIALIZED_VIEW".to_string()];
 
-        let filtered = filter_object_infos(objects, Some("orders"), Some(1), Some(1), Some(&object_types));
+        let filtered = filter_object_infos(objects, Some("orders"), Some(1), Some(1), Some(&object_types), None);
 
         assert_eq!(filtered.into_iter().map(|object| object.name).collect::<Vec<_>>(), vec!["monthly_orders_mv"]);
     }
@@ -4123,7 +4864,7 @@ for line in sys.stdin:
         let objects = vec![order_view, sync_user, test_object_info("audit_log", "TABLE")];
 
         let object_types = vec!["VIEW".to_string()];
-        let filtered = filter_object_infos(objects, Some("revenue"), None, None, Some(&object_types));
+        let filtered = filter_object_infos(objects, Some("revenue"), None, None, Some(&object_types), None);
 
         assert_eq!(filtered.into_iter().map(|object| object.name).collect::<Vec<_>>(), vec!["order_view"]);
     }
@@ -4311,6 +5052,17 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn postgres_extension_metadata_fallback_targets_pg_compatible_agents() {
+        for db_type in [DatabaseType::Highgo, DatabaseType::Vastbase] {
+            assert!(agent_postgres_extension_fallback_config(Some(&test_connection_config(db_type))).is_some());
+        }
+        for db_type in [DatabaseType::Kingbase, DatabaseType::Uxdb, DatabaseType::Postgres, DatabaseType::Mysql] {
+            assert!(agent_postgres_extension_fallback_config(Some(&test_connection_config(db_type))).is_none());
+        }
+        assert!(agent_postgres_extension_fallback_config(None).is_none());
+    }
+
+    #[test]
     fn agent_metadata_timeout_defaults_to_sixty_seconds_and_honors_longer_config() {
         assert_eq!(super::agent_metadata_timeout(None), Some(std::time::Duration::from_secs(60)));
 
@@ -4477,66 +5229,137 @@ for line in sys.stdin:
 
     #[test]
     fn oracle_columns_sql_uses_exact_table_name_for_quoted_lowercase_tables() {
-        let sql = oracle_columns_sql("DBX_TEST", "test");
+        let sql = oracle_columns_sql("DBX_TEST", "test").unwrap();
 
         assert!(sql.contains("ALL_TAB_COLUMNS"));
         assert!(sql.contains("ALL_COL_COMMENTS"));
-        assert!(sql.contains("o.OWNER = 'DBX_TEST'"));
-        assert!(sql.contains("o.OBJECT_NAME = 'test'"));
+        assert!(!sql.contains("SYS_CONTEXT"));
+        assert!(!sql.contains("ALL_SYNONYMS"));
+        assert!(!sql.contains("CONNECT BY"));
+        assert!(sql.contains("c.OWNER = 'DBX_TEST'"));
+        assert!(sql.contains("c.TABLE_NAME = 'test'"));
         assert!(sql.contains("cols.OWNER = c.OWNER"));
         assert!(sql.contains("cols.TABLE_NAME = c.TABLE_NAME"));
         assert!(sql.contains("cm.OWNER = c.OWNER"));
     }
 
     #[test]
-    fn oracle_columns_sql_resolves_private_and_public_synonyms_in_oracle_precedence_order() {
-        let sql = oracle_columns_sql("", "ORDERS_ALIAS");
+    fn oracle_synonym_sql_resolves_private_before_public_without_hierarchical_queries() {
+        let sql = oracle_synonym_target_sql("Dbx'Owner", "ORDERS_ALIAS", true).unwrap();
 
-        assert!(sql.contains("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"));
+        assert!(!sql.contains("SYS_CONTEXT"));
         assert!(sql.contains("FROM ALL_SYNONYMS s"));
-        assert!(sql.contains("s.OWNER IN (SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), 'PUBLIC')"));
-        assert!(sql.contains("CASE WHEN sc.root_owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') THEN 1 ELSE 2 END"));
+        assert!(sql.contains("s.OWNER IN ('Dbx''Owner', 'PUBLIC')"));
+        assert!(sql.contains("CASE WHEN s.OWNER = 'Dbx''Owner' THEN 0 ELSE 1 END"));
         assert!(sql.contains("s.DB_LINK IS NULL"));
-        assert!(sql.contains("ORDER BY resolution_priority, synonym_depth"));
-        assert!(sql.contains("WHERE ROWNUM = 1"));
+        assert!(!sql.contains("CONNECT BY"));
+
+        let nested_sql = oracle_synonym_target_sql("OTHER_OWNER", "ORDERS_ALIAS_2", false).unwrap();
+        assert!(nested_sql.contains("s.OWNER = 'OTHER_OWNER'"));
+        assert!(!nested_sql.contains("s.OWNER IN"));
     }
 
     #[test]
-    fn oracle_columns_sql_follows_two_level_synonyms_without_cycles() {
-        let sql = oracle_columns_sql("DBX_TEST", "ORDERS_ALIAS");
+    fn oracle_blank_schema_requires_a_resolved_current_schema_literal() {
+        assert_eq!(
+            ORACLE_CURRENT_SCHEMA_SQL,
+            "SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS CURRENT_SCHEMA FROM DUAL"
+        );
+        assert!(oracle_columns_sql("", "ORDERS_ALIAS").is_err());
 
-        assert!(sql.contains("SELECT CONNECT_BY_ROOT s.OWNER AS root_owner"));
-        assert!(sql.contains("LEVEL AS synonym_depth"));
-        assert!(sql.contains("CONNECT BY NOCYCLE"));
-        assert!(sql.contains("PRIOR s.TABLE_OWNER = s.OWNER"));
-        assert!(sql.contains("PRIOR s.TABLE_NAME = s.SYNONYM_NAME"));
-        assert!(sql.contains("JOIN ALL_OBJECTS o"));
-        assert!(sql.contains("o.OWNER = sc.resolved_owner"));
-        assert!(sql.contains("o.OBJECT_NAME = sc.resolved_table"));
+        let current_schema = oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["current_schema"],
+            vec![vec![serde_json::json!("  Mixed'Case  ")]],
+        ))
+        .unwrap();
+        assert_eq!(current_schema, "Mixed'Case");
+        let sql = oracle_columns_sql_for_resolved_owner(&current_schema, "ORDERS_ALIAS").unwrap();
+        let synonym_sql = oracle_synonym_target_sql(&current_schema, "ORDERS_ALIAS", true).unwrap();
+
+        assert!(sql.contains("c.OWNER = 'Mixed''Case'"));
+        assert!(synonym_sql.contains("s.OWNER IN ('Mixed''Case', 'PUBLIC')"));
+        assert!(!sql.contains("SYS_CONTEXT"));
+    }
+
+    #[test]
+    fn oracle_current_schema_result_rejects_missing_empty_and_non_string_values() {
+        assert!(oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["OTHER"],
+            vec![vec![serde_json::json!("DBX_TEST")]],
+        ))
+        .is_err());
+        let missing_rows = oracle_current_schema_result(&["CURRENT_SCHEMA"], Vec::new());
+        assert!(oracle_current_schema_from_query_result(missing_rows).is_err());
+        assert!(oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["CURRENT_SCHEMA"],
+            vec![vec![serde_json::json!("   ")]],
+        ))
+        .is_err());
+        assert!(oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["CURRENT_SCHEMA"],
+            vec![vec![serde_json::json!(11)]],
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn oracle_synonym_resolver_follows_two_levels_and_rejects_cycles() {
+        let initial = OracleObjectRef { owner: "DBX_TEST".to_string(), name: "ORDERS_ALIAS".to_string() };
+        let mut resolver = OracleSynonymResolver::new(initial.owner.clone(), initial.name.clone());
+
+        assert_eq!(resolver.current(), &initial);
+        assert!(resolver.include_public_synonym());
+        assert!(resolver.follow(OracleObjectRef { owner: "APP".to_string(), name: "ORDERS_ALIAS_2".to_string() }));
+        assert!(!resolver.include_public_synonym());
+        assert!(resolver.follow(OracleObjectRef { owner: "DATA".to_string(), name: "ORDERS".to_string() }));
+        assert_eq!(resolver.current().owner, "DATA");
+        assert_eq!(resolver.current().name, "ORDERS");
+        assert!(!resolver.follow(initial));
     }
 
     #[test]
     fn oracle_columns_sql_preserves_quoted_case_synonym_names_and_excludes_database_links() {
-        let sql = oracle_columns_sql("DBX_TEST", "Order Alias");
+        let sql = oracle_synonym_target_sql("DBX_TEST", "Order Alias", true).unwrap();
 
         assert!(sql.contains("s.SYNONYM_NAME = 'Order Alias'"));
-        assert!(sql.contains("o.OBJECT_NAME = 'Order Alias'"));
         assert!(!sql.contains("ORDER ALIAS"));
-        assert_eq!(sql.matches("s.DB_LINK IS NULL").count(), 2);
+        assert_eq!(sql.matches("s.DB_LINK IS NULL").count(), 1);
     }
 
     #[test]
-    fn oracle_session_completion_queries_synonym_aware_columns_sql_first() {
-        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", Some("tab-1")));
-        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "   ", Some("tab-1")));
+    fn oracle_synonym_target_preserves_dictionary_identifier_values() {
+        let target = oracle_synonym_target_from_query_result(oracle_current_schema_result(
+            &["table_name", "table_owner"],
+            vec![vec![serde_json::json!("Order Detail"), serde_json::json!("Mixed Owner")]],
+        ))
+        .unwrap();
+
+        assert_eq!(target.owner, "Mixed Owner");
+        assert_eq!(target.name, "Order Detail");
     }
 
     #[test]
-    fn oracle_columns_sql_first_is_limited_to_current_schema_editor_sessions() {
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "DBX_TEST", Some("tab-1")));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", None));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", Some("  ")));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Postgres, "", Some("tab-1")));
+    fn oracle_synonym_resolver_enforces_maximum_depth() {
+        let mut resolver = OracleSynonymResolver::new("DBX_TEST".to_string(), "ALIAS_0".to_string());
+        for depth in 1..=ORACLE_SYNONYM_MAX_DEPTH {
+            assert!(resolver.follow(OracleObjectRef { owner: "DBX_TEST".to_string(), name: format!("ALIAS_{depth}") }));
+        }
+
+        assert!(!resolver.can_follow());
+        assert!(!resolver.follow(OracleObjectRef { owner: "DBX_TEST".to_string(), name: "ALIAS_TOO_DEEP".to_string() }));
+    }
+
+    #[test]
+    fn oracle_columns_sql_first_handles_current_schema_editor_sessions() {
+        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("tab-1")));
+    }
+
+    #[test]
+    fn oracle_columns_sql_first_handles_explicit_schema_editor_sessions() {
+        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("tab-1")));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, None));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("  ")));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Postgres, Some("tab-1")));
     }
 
     #[test]
@@ -4840,13 +5663,16 @@ pub async fn list_objects_core(
     limit: Option<usize>,
     offset: Option<usize>,
     object_types: Option<&[String]>,
+    table_name_filter: Option<&TableNameFilter>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
     let db_config = connection_config(state, connection_id).await;
     let filter_locally_after_oracle_comments = db_config.as_ref().is_some_and(|config| {
         config.db_type == DatabaseType::Oracle && filter.is_some_and(|filter| !filter.trim().is_empty())
     });
-    let use_oracle_agent_paging =
-        db_config.as_ref().is_some_and(is_default_oracle_agent_config) && !filter_locally_after_oracle_comments;
+    let force_local_table_name_filter = table_name_filter.is_some_and(|filter| !filter.is_empty());
+    let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config)
+        && !filter_locally_after_oracle_comments
+        && !force_local_table_name_filter;
     let metadata_session = EphemeralAgentMetadataSession::open(state, connection_id, Some(database), "objects").await;
     let result = retry_metadata_connection_for_session(
         state,
@@ -4863,6 +5689,7 @@ pub async fn list_objects_core(
                 limit,
                 offset,
                 object_types,
+                table_name_filter,
                 metadata_session.client_session_id(),
             )
             .await
@@ -4874,7 +5701,7 @@ pub async fn list_objects_core(
                 } else {
                     offset
                 };
-                filter_object_infos(outcome.objects, filter, limit, final_offset, object_types)
+                filter_object_infos(outcome.objects, filter, limit, final_offset, object_types, table_name_filter)
             })?;
             Ok(objects)
         },
@@ -4962,56 +5789,51 @@ pub async fn completion_assistant_search_core(
             .await?;
         log::debug!("[schema][completion_assistant:start] {request_summary}");
         {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, completion_assistant_search, &request);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            try_sqlserver!(pool_handle, completion_assistant_search, &request);
         }
 
         {
-            let connections = state.connections.read().await;
-            if let Some(pool) = connections.get(&pool_key).and_then(|pool| match pool {
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(pool) = pool_handle.as_ref().and_then(|pool| match pool {
                 PoolKind::Sqlite(pool) => Some(pool.clone()),
                 _ => None,
             }) {
-                drop(connections);
                 return db::sqlite::completion_assistant_search(&pool, &request).await;
             }
         }
 
         #[cfg(feature = "duckdb-sidecar")]
         {
-            let connections = state.connections.read().await;
-            if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
-                drop(connections);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), DuckDbWorker) {
                 return client.completion_assistant(request.clone()).await;
             }
         }
 
         {
-            let connections = state.connections.read().await;
-            if let Some(pool) = connections.get(&pool_key).and_then(|pool| match pool {
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(pool) = pool_handle.as_ref().and_then(|pool| match pool {
                 PoolKind::Postgres(pool) => Some(pool.clone()),
                 _ => None,
             }) {
-                drop(connections);
                 return db::postgres::completion_assistant_search(&pool, &request).await;
             }
         }
 
         {
-            let connections = state.connections.read().await;
-            if let Some(pool) = connections.get(&pool_key).and_then(|pool| match pool {
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(pool) = pool_handle.as_ref().and_then(|pool| match pool {
                 PoolKind::Mysql(pool, mode) if *mode != MysqlMode::OceanBaseOracle => Some(pool.clone()),
                 _ => None,
             }) {
-                drop(connections);
                 return db::mysql::completion_assistant_search(&pool, &request).await;
             }
         }
 
         {
-            let connections = state.connections.read().await;
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 let db_config = connection_config(state, &request.connection_id).await;
                 let mut client = client.lock().await;
                 match client
@@ -5194,11 +6016,19 @@ async fn list_object_statistics_once(
 ) -> Result<Vec<db::ObjectStatistics>, String> {
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    try_sqlserver!(connections, &pool_key, list_object_statistics, schema);
-    if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+    let pool_handle = state.pool_handle(&pool_key).await;
+    try_sqlserver!(pool_handle, list_object_statistics, schema);
+    if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
+        // Generic JDBC connections have no `listObjectStatistics` RPC, so the
+        // vendor statistics SQL is issued over the plugin's query channel.
+        if let Some(dialect) = external_driver_statistics_dialect(config.as_ref()) {
+            let config = config.clone();
+            let session = session.clone();
+            return external_driver_list_object_statistics(session, config.as_ref(), dialect, database, schema).await;
+        }
+    }
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle) {
-            drop(connections);
             return oracle_agent_list_object_statistics(
                 client,
                 database,
@@ -5208,7 +6038,6 @@ async fn list_object_statistics_once(
             .await;
         }
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Dameng) {
-            drop(connections);
             return dameng_agent_list_object_statistics(
                 client,
                 database,
@@ -5219,7 +6048,6 @@ async fn list_object_statistics_once(
         }
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
             let sql = kingbase::object_statistics_sql(schema);
-            drop(connections);
             return agent_list_object_statistics(
                 client,
                 database,
@@ -5233,7 +6061,6 @@ async fn list_object_statistics_once(
             config.db_type == DatabaseType::Gbase && config.driver_profile.as_deref() != Some("gbase8s")
         }) {
             let sql = gbase8a_object_statistics_sql(database);
-            drop(connections);
             return agent_list_object_statistics(
                 client,
                 database,
@@ -5244,11 +6071,9 @@ async fn list_object_statistics_once(
             .await;
         }
     }
-    if let Some(client) = extract_pool!(&connections, &pool_key, VictoriaMetrics) {
-        drop(connections);
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), VictoriaMetrics) {
         return db::victoriametrics_driver::list_object_statistics(&client).await;
     }
-    drop(connections);
     let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
     match &pool {
         PoolKind::Mysql(p, mode) => {
@@ -5272,6 +6097,18 @@ struct ObjectListOutcome {
     paging_applied: bool,
 }
 
+async fn list_native_postgres_objects(
+    pool: &deadpool_postgres::Pool,
+    config: &ConnectionConfig,
+    schema: &str,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    if config.db_type == DatabaseType::Redshift {
+        db::postgres::list_redshift_objects(pool, schema, true, true).await
+    } else {
+        db::postgres::list_objects(pool, schema, true, true, false).await
+    }
+}
+
 fn unpaged_object_list(objects: Vec<db::ObjectInfo>) -> ObjectListOutcome {
     ObjectListOutcome { objects, paging_applied: false }
 }
@@ -5285,20 +6122,26 @@ async fn list_objects_once(
     limit: Option<usize>,
     offset: Option<usize>,
     object_types: Option<&[String]>,
+    table_name_filter: Option<&TableNameFilter>,
     client_session_id: Option<&str>,
 ) -> Result<ObjectListOutcome, String> {
     let pool_key =
         state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await?;
     let db_config = connection_config(state, connection_id).await;
-    let (mysql_limit, mysql_offset) =
-        if filter.is_none_or(|value| value.trim().is_empty()) { (limit, offset) } else { (None, None) };
+    let force_local_table_name_filter = table_name_filter.is_some_and(|filter| !filter.is_empty());
+    let (mysql_limit, mysql_offset) = if filter.is_none_or(|value| value.trim().is_empty())
+        && table_name_filter.is_none_or(|filter| filter.is_empty())
+    {
+        (limit, offset)
+    } else {
+        (None, None)
+    };
 
     {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             if uses_presto_like_information_schema_tables(&config.db_type) {
                 return external_driver_presto_like_objects(
                     session,
@@ -5328,19 +6171,17 @@ async fn list_objects_once(
                 .await
                 .map(unpaged_object_list);
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
             let mut client = lock_sqlserver_metadata_client(&client).await?;
             return db::sqlserver::list_objects(&mut client, schema).await.map(unpaged_object_list);
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
             let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config);
             let filter_locally_after_oracle_comments =
                 is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
             let timeout_duration = agent_metadata_timeout(db_config.as_ref());
             let fallback_config = db_config.clone();
-            drop(connections);
             if is_oracle && !use_oracle_agent_paging {
                 return oracle_agent_list_objects(client, database, schema, timeout_duration)
                     .await
@@ -5348,14 +6189,14 @@ async fn list_objects_once(
             }
             let mut client = client.lock().await;
             let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
-            let agent_limit = if filter_locally_after_oracle_comments {
+            let agent_limit = if filter_locally_after_oracle_comments || force_local_table_name_filter {
                 None
             } else if use_oracle_agent_paging {
                 limit
             } else {
                 None
             };
-            let agent_offset = if filter_locally_after_oracle_comments {
+            let agent_offset = if filter_locally_after_oracle_comments || force_local_table_name_filter {
                 None
             } else if use_oracle_agent_paging {
                 offset
@@ -5398,7 +6239,7 @@ async fn list_objects_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_objects(&pool, schema, true, true, false)
+                                return list_native_postgres_objects(&pool, config, schema)
                                     .await
                                     .map(unpaged_object_list)
                             }
@@ -5427,7 +6268,7 @@ async fn list_objects_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_objects(&pool, schema, true, true, false)
+                            return list_native_postgres_objects(&pool, config, schema)
                                 .await
                                 .map(unpaged_object_list)
                                 .map_err(|fallback_error| {
@@ -5455,6 +6296,8 @@ async fn list_objects_once(
                 db::manticoresearch::list_objects(p, database).await.map(unpaged_object_list)
             } else if db_config.as_ref().is_some_and(db::starrocks::is_config) {
                 db::starrocks::list_table_objects(p, database).await.map(unpaged_object_list)
+            } else if db_config.as_ref().is_some_and(db::oceanbase_mysql::is_config) {
+                db::oceanbase_mysql::list_objects(p, database).await.map(unpaged_object_list)
             } else if db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata) {
                 db::mysql::list_table_objects_show(p, database).await.map(unpaged_object_list)
             } else if mysql_table_list_source_for_config(db_config.as_ref()) == MysqlTableListSource::ShowFullTables {
@@ -5472,6 +6315,13 @@ async fn list_objects_once(
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_cloudberry_config) => {
             db::cloudberry::list_objects(p, schema).await.map(unpaged_object_list)
+        }
+        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Redshift) => {
+            let include_relations = object_types_include_relations(object_types);
+            let include_routines = object_types_include_routines(object_types);
+            db::postgres::list_redshift_objects(p, schema, include_relations, include_routines)
+                .await
+                .map(unpaged_object_list)
         }
         PoolKind::Postgres(p) => {
             let include_relations = object_types_include_relations(object_types);
@@ -5518,11 +6368,10 @@ async fn list_completion_objects_once(
         state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await?;
     let db_config = connection_config(state, connection_id).await;
 
-    let connections = state.connections.read().await;
-    if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+    let pool_handle = state.pool_handle(&pool_key).await;
+    if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
         let config = config.clone();
         let session = session.clone();
-        drop(connections);
         return session
             .invoke_with_timeout::<Vec<db::ObjectInfo>>(
                 "listObjects",
@@ -5532,10 +6381,9 @@ async fn list_completion_objects_once(
             .await
             .map(filter_completion_objects);
     }
-    if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+    if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
         let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
         let fallback_config = db_config.clone();
-        drop(connections);
         let objects = if is_oracle {
             oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref())).await?
         } else {
@@ -5549,7 +6397,7 @@ async fn list_completion_objects_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_objects(&pool, schema, true, true, false)
+                                return list_native_postgres_objects(&pool, config, schema)
                                     .await
                                     .map(filter_completion_objects)
                             }
@@ -5574,7 +6422,7 @@ async fn list_completion_objects_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_objects(&pool, schema, true, true, false)
+                            return list_native_postgres_objects(&pool, config, schema)
                                 .await
                                 .map(filter_completion_objects)
                                 .map_err(|fallback_error| {
@@ -5592,7 +6440,6 @@ async fn list_completion_objects_once(
         return Ok(filter_completion_objects(objects));
     }
 
-    drop(connections);
     let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
     match &pool {
         PoolKind::Mysql(p, mode) if *mode != MysqlMode::OceanBaseOracle => {
@@ -5607,12 +6454,15 @@ async fn list_completion_objects_once(
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_cloudberry_config) => {
             db::cloudberry::list_objects(p, schema).await.map(filter_completion_objects)
         }
+        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Redshift) => {
+            db::postgres::list_redshift_objects(p, schema, false, true).await.map(filter_completion_objects)
+        }
         PoolKind::Postgres(p) => {
             db::postgres::list_objects(p, schema, true, true, false).await.map(filter_completion_objects)
         }
         PoolKind::SqlServer(_) => {
             let outcome =
-                list_objects_once(state, connection_id, database, schema, None, None, None, None, None).await?;
+                list_objects_once(state, connection_id, database, schema, None, None, None, None, None, None).await?;
             Ok(filter_completion_objects(outcome.objects))
         }
         _ => Ok(Vec::new()),
@@ -5634,6 +6484,10 @@ fn is_agent_postgres_metadata_fallback_config(config: &ConnectionConfig) -> bool
     // agent returns no rows. UXDB is JDBC-only; opening a PostgreSQL fallback
     // connection there turns valid empty schemas into misleading DB errors.
     matches!(config.db_type, DatabaseType::Highgo | DatabaseType::Vastbase)
+}
+
+fn agent_postgres_extension_fallback_config(config: Option<&ConnectionConfig>) -> Option<&ConnectionConfig> {
+    config.filter(|config| is_agent_postgres_metadata_fallback_config(config))
 }
 
 async fn native_postgres_metadata_pool(
@@ -5903,16 +6757,15 @@ async fn get_columns_core_for_session_inner(
         let db_config = connection_config(state, connection_id).await;
 
         {
-            let connections = state.connections.read().await;
-            if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
                 let config = config.clone();
                 let session = session.clone();
-                drop(connections);
-                if uses_presto_like_information_schema_tables(&config.db_type) {
+                                if uses_presto_like_information_schema_tables(&config.db_type) {
                     return external_driver_presto_like_columns(session, config.as_ref(), database, schema, table).await;
                 }
                 let query_oracle_columns_first =
-                    should_query_oracle_columns_via_sql_first(&config.db_type, schema, context_session_id);
+                    should_query_oracle_columns_via_sql_first(&config.db_type, context_session_id);
                 if query_oracle_columns_first {
                     match external_driver_oracle_columns_via_sql(
                         session.clone(),
@@ -5976,31 +6829,29 @@ async fn get_columns_core_for_session_inner(
                 return Ok(deduplicate_column_infos(columns));
             }
             #[cfg(feature = "duckdb-sidecar")]
-            if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), DuckDbWorker) {
                 let database = database.to_string();
                 let schema = schema.to_string();
                 let table = table.to_string();
-                drop(connections);
-                return client.list_columns(database, schema, table).await;
+                                return client.list_columns(database, schema, table).await;
             }
-            if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
-                drop(connections);
-                return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), ClickHouse) {
+                                return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
                     .await
                     .map(deduplicate_column_infos);
             }
-            if let Some(client) = extract_pool!(&connections, &pool_key, InfluxDb) {
-                drop(connections);
-                return db::influxdb_driver::get_columns(&client, database, table).await.map(deduplicate_column_infos);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), InfluxDb) {
+                                return db::influxdb_driver::get_columns(&client, database, table).await.map(deduplicate_column_infos);
             }
-            if let Some(client) = extract_pool!(&connections, &pool_key, VictoriaMetrics) {
-                drop(connections);
-                return db::victoriametrics_driver::get_columns(&client, table).await.map(deduplicate_column_infos);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), InfluxDb3) {
+                                return db::influxdb3_driver::get_columns(&client, database, table).await.map(deduplicate_column_infos);
+            }
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), VictoriaMetrics) {
+                                return db::victoriametrics_driver::get_columns(&client, table).await.map(deduplicate_column_infos);
             }
             if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
-                if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-                    drop(connections);
-                    let mut client = lock_sqlserver_metadata_client(&client).await?;
+                if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
+                                        let mut client = lock_sqlserver_metadata_client(&client).await?;
                     return db::sqlserver::get_linked_server_columns(
                         &mut client,
                         &linked.server,
@@ -6012,13 +6863,12 @@ async fn get_columns_core_for_session_inner(
                     .map(deduplicate_column_infos);
                 }
             }
-            try_sqlserver!(connections, &pool_key, get_columns, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            try_sqlserver!(pool_handle, get_columns, schema, table);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 let fallback_config = db_config.clone();
-                drop(connections);
-                let mut client = client.lock().await;
+                                let mut client = client.lock().await;
                 let oracle_sql_config = fallback_config.as_ref().filter(|config| {
-                    should_query_oracle_columns_via_sql_first(&config.db_type, schema, context_session_id)
+                    should_query_oracle_columns_via_sql_first(&config.db_type, context_session_id)
                 });
                 let query_oracle_columns_first = oracle_sql_config.is_some();
                 if let Some(config) = oracle_sql_config {
@@ -6199,8 +7049,8 @@ pub async fn get_sqlserver_column_metadata_core(
 ) -> Result<Vec<db::sqlserver::SqlServerColumnMetadata>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
-        let connections = state.connections.read().await;
-        try_sqlserver!(connections, &pool_key, get_column_metadata, schema, table);
+        let pool_handle = state.pool_handle(&pool_key).await;
+        try_sqlserver!(pool_handle, get_column_metadata, schema, table);
         Err("SQL Server column metadata requires a native SQL Server connection".to_string())
     })
     .await
@@ -6305,6 +7155,64 @@ pub async fn list_indexes_core(
     result
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceKeyInfo {
+    pub columns: Vec<String>,
+}
+
+pub fn reference_keys_from_indexes(indexes: &[db::IndexInfo]) -> Vec<ReferenceKeyInfo> {
+    let mut keys = Vec::new();
+    for index in indexes {
+        if !index.is_unique
+            || index.filter.as_deref().is_some_and(|filter| !filter.trim().is_empty())
+            || index.columns.is_empty()
+            || index.key_is_expression.iter().any(|is_expression| *is_expression)
+        {
+            continue;
+        }
+        let columns = index.columns.iter().map(|column| column.trim().to_string()).collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        if columns.iter().any(|column| column.is_empty() || !seen.insert(column.as_str())) {
+            continue;
+        }
+        let key = ReferenceKeyInfo { columns };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+pub fn reference_key_columns_from_indexes(indexes: &[db::IndexInfo]) -> Vec<String> {
+    reference_keys_from_indexes(indexes)
+        .into_iter()
+        .filter_map(|key| (key.columns.len() == 1).then(|| key.columns[0].clone()))
+        .collect()
+}
+
+pub async fn list_reference_keys_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ReferenceKeyInfo>, String> {
+    let indexes = list_indexes_core(state, connection_id, database, schema, table).await?;
+    Ok(reference_keys_from_indexes(&indexes))
+}
+
+pub async fn list_reference_key_columns_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    let indexes = list_indexes_core(state, connection_id, database, schema, table).await?;
+    Ok(reference_key_columns_from_indexes(&indexes))
+}
+
 async fn list_indexes_core_for_session(
     state: &AppState,
     connection_id: &str,
@@ -6319,10 +7227,30 @@ async fn list_indexes_core_for_session(
         let db_config = connection_config(state, connection_id).await;
 
         {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            try_sqlserver!(pool_handle, list_indexes, schema, table);
+            if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
+                if external_driver_uses_mysql_ddl(config.as_ref()) {
+                    let config = config.clone();
+                    let session = session.clone();
+                    return external_driver_gaussdb_m_indexes(session, config.as_ref(), database, schema, table).await;
+                }
+                let config = config.clone();
+                let session = session.clone();
+                return session
+                    .invoke_with_timeout::<Vec<db::IndexInfo>>(
+                        "listIndexes",
+                        serde_json::json!({
+                            "connection": config.as_ref(),
+                            "database": database,
+                            "schema": schema,
+                            "table": table,
+                        }),
+                        agent_metadata_timeout(Some(config.as_ref())),
+                    )
+                    .await;
+            }
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 let mut client = client.lock().await;
                 return client.list_indexes(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
             }
@@ -6404,10 +7332,9 @@ async fn list_foreign_keys_core_for_session(
         let db_config = connection_config(state, connection_id).await;
 
         {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, list_foreign_keys, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            try_sqlserver!(pool_handle, list_foreign_keys, schema, table);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 let mut client = client.lock().await;
                 return client
                     .list_foreign_keys(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
@@ -6424,6 +7351,9 @@ async fn list_foreign_keys_core_for_session(
                 } else {
                     db::mysql::list_foreign_keys(p, mysql_table_metadata_catalog(database, schema), table).await
                 }
+            }
+            PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_opengauss_constraint_config) => {
+                db::postgres::list_opengauss_foreign_keys(p, schema, table).await
             }
             PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
@@ -6451,10 +7381,9 @@ pub async fn list_triggers_core(
         let db_config = connection_config(state, connection_id).await;
 
         {
-            let connections = state.connections.read().await;
-            try_sqlserver!(connections, &pool_key, list_triggers, schema, table);
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            try_sqlserver!(pool_handle, list_triggers, schema, table);
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 let mut client = client.lock().await;
                 return client.list_triggers(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
             }
@@ -6481,9 +7410,9 @@ pub async fn list_triggers_core(
     .await
 }
 
-// These object kinds are currently exposed by the Xugu agent only. Keeping
-// the core route generic makes the protocol reusable without altering the
-// metadata behavior of any built-in database driver.
+/// Lists structured constraints for a relation. Exposed generically so the
+/// agent protocol and native drivers share one route; the built-in drivers
+/// that implement it today are PostgreSQL, OpenGauss, and the Xugu agent.
 pub async fn list_constraints_core(
     state: &AppState,
     connection_id: &str,
@@ -6494,13 +7423,35 @@ pub async fn list_constraints_core(
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let db_config = connection_config(state, connection_id).await;
-        let connections = state.connections.read().await;
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
-            let mut client = client.lock().await;
-            return client.list_constraints(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
+
+        {
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
+                let mut client = client.lock().await;
+                return client
+                    .list_constraints(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
+                    .await;
+            }
         }
-        Ok(vec![])
+
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+
+        match &pool {
+            // QuestDB speaks the PostgreSQL wire protocol but has no
+            // constraint metadata, and Redshift does not enforce or expose
+            // constraint definitions, so neither reports any.
+            PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => Ok(vec![]),
+            PoolKind::Postgres(_)
+                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Redshift) =>
+            {
+                Ok(vec![])
+            }
+            PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_opengauss_constraint_config) => {
+                db::postgres::list_opengauss_constraints(p, schema, table).await
+            }
+            PoolKind::Postgres(p) => db::postgres::list_constraints(p, schema, table).await,
+            _ => Ok(vec![]),
+        }
     })
     .await
 }
@@ -6515,9 +7466,8 @@ pub async fn list_partitions_core(
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let db_config = connection_config(state, connection_id).await;
-        let connections = state.connections.read().await;
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let mut client = client.lock().await;
             return client.list_partitions(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
@@ -6548,8 +7498,8 @@ pub async fn table_partition_status_core(
 ) -> Result<TablePartitionStatus, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => {
                 let info = db::postgres::get_table_partition_info(pool, schema, table).await?;
                 Ok(TablePartitionStatus {
@@ -6574,8 +7524,8 @@ pub async fn list_invalid_indexes_core(
 ) -> Result<Vec<String>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => db::postgres::list_invalid_indexes(pool, schema, table).await,
             _ => Ok(vec![]),
         }
@@ -6593,9 +7543,8 @@ pub async fn list_subpartitions_core(
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let db_config = connection_config(state, connection_id).await;
-        let connections = state.connections.read().await;
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let mut client = client.lock().await;
             return client
                 .list_subpartitions(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
@@ -6612,16 +7561,193 @@ pub async fn list_functions_core(
     database: &str,
     schema: &str,
 ) -> Result<Vec<db::FunctionInfo>, String> {
-    retry_metadata_connection(state, connection_id, Some(database), || async {
+    let postgres_functions = retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
         match &pool {
-            PoolKind::Postgres(p) => db::postgres::list_functions(p, schema).await,
-            _ => Ok(vec![]),
+            PoolKind::Postgres(p) => Ok(Some(db::postgres::list_functions(p, schema).await?)),
+            _ => Ok(None),
         }
     })
+    .await?;
+
+    if let Some(functions) = postgres_functions {
+        return Ok(functions);
+    }
+
+    // Non-Postgres: reuse sidebar list_objects + get_object_source paths.
+    list_functions_via_objects(state, connection_id, database, schema).await
+}
+
+/// Build FunctionInfo for non-Postgres pools by reusing list_objects + get_object_source
+/// (same paths the sidebar uses for PROCEDURE/FUNCTION).
+async fn list_functions_via_objects(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::FunctionInfo>, String> {
+    let object_types = ["PROCEDURE".to_string(), "FUNCTION".to_string()];
+    let objects =
+        list_objects_core(state, connection_id, database, schema, None, None, None, Some(&object_types), None).await?;
+
+    // Bound concurrent get_object_source calls (N+1) without requiring AppState: Clone.
+    const CONCURRENCY: usize = 8;
+    let mut functions = Vec::with_capacity(objects.len());
+    for chunk in objects.chunks(CONCURRENCY) {
+        let chunk_results = futures::future::join_all(
+            chunk
+                .iter()
+                .map(|object| load_function_info_via_object(state, connection_id, database, schema, object.clone())),
+        )
+        .await;
+        functions.extend(chunk_results.into_iter().flatten());
+    }
+
+    Ok(functions)
+}
+
+fn schema_diff_routine_kind(object_type: &str) -> Option<(&'static str, db::ObjectSourceKind)> {
+    let object_type_upper = object_type.to_ascii_uppercase();
+    if object_type_upper.contains("PROC") {
+        Some(("PROCEDURE", db::ObjectSourceKind::Procedure))
+    } else if object_type_upper.contains("FUNC") {
+        Some(("FUNCTION", db::ObjectSourceKind::Function))
+    } else {
+        None
+    }
+}
+
+async fn load_function_info_via_object(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    object: db::ObjectInfo,
+) -> Option<db::FunctionInfo> {
+    let (function_type, source_kind) = schema_diff_routine_kind(&object.object_type)?;
+
+    let definition = match get_object_source_core(
+        state,
+        connection_id,
+        database,
+        schema,
+        &object.name,
+        source_kind.clone(),
+        object.signature.as_deref(),
+        None,
+    )
     .await
+    {
+        Ok(source) if !source.source.trim().is_empty() => source.source,
+        Ok(_) | Err(_) => {
+            // Retry the alternate routine kind when the primary getter is empty/fails.
+            let alternate = match source_kind {
+                db::ObjectSourceKind::Procedure => db::ObjectSourceKind::Function,
+                db::ObjectSourceKind::Function => db::ObjectSourceKind::Procedure,
+                other => other,
+            };
+            match get_object_source_core(
+                state,
+                connection_id,
+                database,
+                schema,
+                &object.name,
+                alternate,
+                object.signature.as_deref(),
+                None,
+            )
+            .await
+            {
+                Ok(source) if !source.source.trim().is_empty() => source.source,
+                // Skip objects with no readable source so empty definitions are not treated as loaded.
+                _ => return None,
+            }
+        }
+    };
+
+    Some(db::FunctionInfo {
+        name: object.name,
+        function_type: function_type.to_string(),
+        data_type: String::new(),
+        definition: strip_routine_definer_clause(&definition),
+        arguments: object.signature.unwrap_or_default(),
+    })
+}
+
+/// MySQL's SHOW CREATE PROCEDURE/FUNCTION prefixes `CREATE DEFINER=`user`@`host``.
+/// The definer account typically differs across same-structure databases on
+/// different servers while the routine body is identical, so drop the clause
+/// before schema-diff comparison (same spirit as DBeaver's removeDefiner
+/// option). Definitions without the clause pass through unchanged; the
+/// `^CREATE DEFINER` anchor keeps definer mentions inside a routine body alone.
+fn strip_routine_definer_clause(definition: &str) -> String {
+    static DEFINER_PREFIX: OnceLock<Regex> = OnceLock::new();
+    let definer_prefix = DEFINER_PREFIX.get_or_init(|| {
+        Regex::new(r#"(?is)^\s*CREATE\s+DEFINER\s*=\s*(`(?:[^`]|``)*`|"(?:[^"]|"")*"|[A-Za-z0-9_$]+)@(`(?:[^`]|``)*`|"(?:[^"]|"")*"|[A-Za-z0-9_$.%*-]+)"#).unwrap()
+    });
+    match definer_prefix.find(definition) {
+        Some(found) => format!("CREATE {}", definition[found.end()..].trim_start()),
+        None => definition.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod schema_diff_routine_kind_tests {
+    use super::schema_diff_routine_kind;
+    use crate::db::ObjectSourceKind;
+
+    #[test]
+    fn classifies_procedure_and_function_object_types() {
+        assert_eq!(schema_diff_routine_kind("PROCEDURE"), Some(("PROCEDURE", ObjectSourceKind::Procedure)));
+        assert_eq!(schema_diff_routine_kind("StoredProc"), Some(("PROCEDURE", ObjectSourceKind::Procedure)));
+        assert_eq!(schema_diff_routine_kind("FUNCTION"), Some(("FUNCTION", ObjectSourceKind::Function)));
+        assert_eq!(schema_diff_routine_kind("user_function"), Some(("FUNCTION", ObjectSourceKind::Function)));
+        assert!(schema_diff_routine_kind("TABLE").is_none());
+        assert!(schema_diff_routine_kind("VIEW").is_none());
+    }
+}
+
+#[cfg(test)]
+mod strip_routine_definer_clause_tests {
+    use super::strip_routine_definer_clause;
+
+    #[test]
+    fn strips_backquoted_definer_prefix() {
+        assert_eq!(
+            strip_routine_definer_clause("CREATE DEFINER=`root`@`localhost` PROCEDURE `p`() BEGIN SELECT 1; END"),
+            "CREATE PROCEDURE `p`() BEGIN SELECT 1; END"
+        );
+    }
+
+    #[test]
+    fn strips_bare_definer_prefix() {
+        assert_eq!(
+            strip_routine_definer_clause("CREATE DEFINER=app_user@10.0.0.% FUNCTION `f`() RETURNS int RETURN 1"),
+            "CREATE FUNCTION `f`() RETURNS int RETURN 1"
+        );
+    }
+
+    #[test]
+    fn keeps_definitions_without_definer() {
+        let def = "CREATE PROCEDURE `p`() BEGIN SELECT 1; END";
+        assert_eq!(strip_routine_definer_clause(def), def);
+    }
+
+    #[test]
+    fn keeps_definer_mentions_inside_the_body() {
+        let def = "CREATE PROCEDURE `p`() BEGIN -- CREATE DEFINER=`x`@`y` stays\nSELECT 1; END";
+        assert_eq!(strip_routine_definer_clause(def), def);
+    }
+
+    #[test]
+    fn strips_definer_after_leading_whitespace() {
+        assert_eq!(
+            strip_routine_definer_clause("  CREATE DEFINER=`root`@`%` PROCEDURE `p`() BEGIN END"),
+            "CREATE PROCEDURE `p`() BEGIN END"
+        );
+    }
 }
 
 pub async fn list_sequences_core(
@@ -6675,11 +7801,19 @@ pub async fn list_extensions_core(
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let db_config = connection_config(state, connection_id).await;
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
-            let connections = state.connections.read().await;
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 return kingbase::list_extensions(client, database, schema, agent_metadata_timeout(db_config.as_ref()))
                     .await;
+            }
+        }
+
+        // HighGo and Vastbase use Agent pools but expose PostgreSQL's extension
+        // catalogs. Reuse the native metadata fallback so their installed
+        // extensions are not silently reported as an empty list.
+        if let Some(config) = agent_postgres_extension_fallback_config(db_config.as_ref()) {
+            if let Some(pool) = native_postgres_metadata_pool(state, connection_id, database, config).await? {
+                return db::postgres::list_extensions(&pool, schema).await;
             }
         }
 
@@ -6702,15 +7836,20 @@ pub async fn list_available_extensions_core(
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let db_config = connection_config(state, connection_id).await;
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
-            let connections = state.connections.read().await;
-            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                drop(connections);
+            let pool_handle = state.pool_handle(&pool_key).await;
+            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
                 return kingbase::list_available_extensions(
                     client,
                     database,
                     agent_metadata_timeout(db_config.as_ref()),
                 )
                 .await;
+            }
+        }
+
+        if let Some(config) = agent_postgres_extension_fallback_config(db_config.as_ref()) {
+            if let Some(pool) = native_postgres_metadata_pool(state, connection_id, database, config).await? {
+                return db::postgres::list_available_extensions(&pool).await;
             }
         }
 
@@ -6737,6 +7876,25 @@ pub async fn list_owners_core(
         match &pool {
             PoolKind::Postgres(p) => db::postgres::list_owners(p, schema).await,
             _ => Ok(vec![]),
+        }
+    })
+    .await
+}
+
+pub async fn get_table_owner_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Option<String>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+
+        match &pool {
+            PoolKind::Postgres(p) => db::postgres::get_table_owner(p, schema, table).await,
+            _ => Ok(None),
         }
     })
     .await
@@ -6781,23 +7939,12 @@ pub async fn get_table_ddl_core(
         table,
         object_type,
         TableDdlOptions::SINGLE_RELATION,
+        None,
     )
     .await
 }
 
 pub async fn get_table_export_ddl_core(
-    state: &AppState,
-    connection_id: &str,
-    database: &str,
-    schema: &str,
-    table: &str,
-    object_type: Option<db::ObjectSourceKind>,
-) -> Result<String, String> {
-    get_table_ddl_core_with_options(state, connection_id, database, schema, table, object_type, TableDdlOptions::EXPORT)
-        .await
-}
-
-pub(crate) async fn get_table_relation_export_ddl_core(
     state: &AppState,
     connection_id: &str,
     database: &str,
@@ -6812,7 +7959,30 @@ pub(crate) async fn get_table_relation_export_ddl_core(
         schema,
         table,
         object_type,
+        TableDdlOptions::EXPORT,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn get_table_relation_export_ddl_core_for_session(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    object_type: Option<db::ObjectSourceKind>,
+    client_session_id: Option<&str>,
+) -> Result<String, String> {
+    get_table_ddl_core_with_options(
+        state,
+        connection_id,
+        database,
+        schema,
+        table,
+        object_type,
         TableDdlOptions::RELATION_EXPORT,
+        client_session_id,
     )
     .await
 }
@@ -6833,6 +8003,7 @@ pub async fn get_table_display_ddl_core(
         table,
         object_type,
         TableDdlOptions::DISPLAY,
+        None,
     )
     .await
 }
@@ -6845,6 +8016,7 @@ async fn get_table_ddl_core_with_options(
     table: &str,
     object_type: Option<db::ObjectSourceKind>,
     options: TableDdlOptions,
+    client_session_id: Option<&str>,
 ) -> Result<String, String> {
     if crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema).is_some() {
         return Err("DDL is not supported for SQL Server linked server tables".to_string());
@@ -6889,8 +8061,8 @@ async fn get_table_ddl_core_with_options(
         return Ok(source.source);
     }
 
-    retry_metadata_connection(state, connection_id, Some(database), || {
-        get_table_ddl_once(state, connection_id, database, schema, table, options)
+    retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || {
+        get_table_ddl_once(state, connection_id, database, schema, table, options, client_session_id)
     })
     .await
 }
@@ -6917,28 +8089,43 @@ async fn get_table_ddl_once(
     schema: &str,
     table: &str,
     options: TableDdlOptions,
+    client_session_id: Option<&str>,
 ) -> Result<String, String> {
-    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let pool_key =
+        state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await?;
     let db_config = connection_config(state, connection_id).await;
 
     {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
-            if external_driver_uses_mysql_ddl(config.as_ref()) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
+            if is_oracle_external_driver_config(config.as_ref()) {
                 let config = config.clone();
                 let session = session.clone();
-                drop(connections);
-                return external_driver_mysql_ddl(session, config.as_ref(), database, schema, table).await;
+                return external_driver_oracle_ddl(session, config.as_ref(), database, schema, table).await;
+            }
+            if external_driver_uses_mysql_ddl(config.as_ref())
+                || (config.db_type == DatabaseType::Jdbc && mysql_external_driver_url(config.as_ref()) == Some(true))
+            {
+                let config = config.clone();
+                let session = session.clone();
+                let result = external_driver_mysql_ddl(session.clone(), config.as_ref(), database, schema, table).await;
+                if result.is_err() && config.db_type == DatabaseType::Jdbc {
+                    return external_driver_jdbc_ddl(session, config.as_ref(), database, schema, table).await;
+                }
+                return result;
+            }
+            if external_driver_uses_generic_ddl(config.as_ref()) {
+                let config = config.clone();
+                let session = session.clone();
+                return external_driver_jdbc_ddl(session, config.as_ref(), database, schema, table).await;
             }
         }
         #[cfg(feature = "duckdb-sidecar")]
-        if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), DuckDbWorker) {
             let client = client.clone();
-            drop(connections);
             return client.get_table_ddl(database.to_string(), schema.to_string(), table.to_string()).await;
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), ClickHouse) {
             let clickhouse_database = clickhouse_metadata_database(database, schema);
             let result = db::clickhouse_driver::execute_query(
                 &client,
@@ -6954,13 +8141,11 @@ async fn get_table_ddl_once(
                 .map(|s| s.to_string())
                 .ok_or_else(|| "Table not found".to_string());
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
             let mut client = lock_sqlserver_metadata_client(&client).await?;
             return build_sqlserver_ddl(&mut client, schema, table).await;
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             if let Some(config) = db_config.as_ref().filter(|config| is_agent_postgres_metadata_fallback_config(config))
             {
                 match native_postgres_metadata_pool(state, connection_id, database, config).await {
@@ -7058,6 +8243,10 @@ async fn connection_config(state: &AppState, connection_id: &str) -> Option<Conn
     state.configs.read().await.get(connection_id).cloned()
 }
 
+fn is_opengauss_constraint_config(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::OpenGauss || config.driver_profile.as_deref() == Some("opengauss")
+}
+
 fn is_opengauss_family_config(config: &ConnectionConfig) -> bool {
     matches!(config.db_type, DatabaseType::OpenGauss | DatabaseType::Gaussdb)
         || matches!(config.driver_profile.as_deref(), Some("opengauss" | "gaussdb"))
@@ -7123,6 +8312,14 @@ fn is_default_oracle_agent_config(config: &ConnectionConfig) -> bool {
         && !matches!(config.driver_profile.as_deref(), Some("oracle-legacy" | "oracle-10g"))
 }
 
+fn uses_oracle_metadata_object_source(config: Option<&ConnectionConfig>, object_type: &db::ObjectSourceKind) -> bool {
+    config.is_some_and(|config| config.db_type == DatabaseType::Oracle)
+        && matches!(
+            object_type,
+            db::ObjectSourceKind::Sequence | db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody
+        )
+}
+
 fn supports_agent_table_paging(config: &ConnectionConfig) -> bool {
     // Keep paging opt-in until each legacy agent is known to apply metadata constraints server-side.
     matches!(config.db_type, DatabaseType::Tdengine) || is_default_oracle_agent_config(config)
@@ -7130,6 +8327,10 @@ fn supports_agent_table_paging(config: &ConnectionConfig) -> bool {
 
 fn agent_paging_likely_applied(enabled: bool, limit: Option<usize>, returned_len: usize) -> bool {
     enabled && limit.is_some_and(|limit| returned_len <= limit)
+}
+
+fn external_driver_paging_likely_applied(driver_id: &str, limit: Option<usize>, returned_len: usize) -> bool {
+    driver_id == "jdbc" && limit.is_some_and(|limit| returned_len <= limit)
 }
 
 fn mysql_show_metadata_database_for_config<'a>(config: Option<&ConnectionConfig>, database: &'a str) -> &'a str {
@@ -7204,9 +8405,8 @@ fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
         return false;
     }
 
-    let connection_string = config.connection_string.as_deref().map(str::trim).filter(|value| !value.is_empty());
     let driver_class = config.jdbc_driver_class.as_deref().map(str::trim).filter(|value| !value.is_empty());
-    let mysql_url = connection_string.map(|value| value.to_ascii_lowercase().starts_with("jdbc:mysql:"));
+    let mysql_url = mysql_external_driver_url(config);
     let mysql_driver = driver_class.map(|value| matches!(value, "com.mysql.cj.jdbc.Driver" | "com.mysql.jdbc.Driver"));
 
     match (mysql_url, mysql_driver) {
@@ -7217,8 +8417,202 @@ fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
     }
 }
 
+fn mysql_external_driver_url(config: &ConnectionConfig) -> Option<bool> {
+    config
+        .connection_string
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase().starts_with("jdbc:mysql:"))
+}
+
+fn is_oracle_external_driver_config(config: &ConnectionConfig) -> bool {
+    if config.db_type != DatabaseType::Jdbc {
+        return false;
+    }
+
+    let connection_string = config.connection_string.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let driver_class = config.jdbc_driver_class.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let oracle_url = connection_string.map(|value| value.to_ascii_lowercase().starts_with("jdbc:oracle:"));
+    let oracle_driver = driver_class.map(|value| {
+        matches!(value.to_ascii_lowercase().as_str(), "oracle.jdbc.oracledriver" | "oracle.jdbc.driver.oracledriver")
+    });
+
+    match (oracle_url, oracle_driver) {
+        (Some(url_matches), Some(driver_matches)) => url_matches && driver_matches,
+        (Some(url_matches), None) => url_matches,
+        (None, Some(driver_matches)) => driver_matches,
+        (None, None) => false,
+    }
+}
+
 fn external_driver_uses_mysql_ddl(config: &ConnectionConfig) -> bool {
     is_mysql_external_driver_config(config) || gaussdb_uses_m_jdbc_driver(config)
+}
+
+async fn external_driver_gaussdb_m_indexes(
+    session: std::sync::Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<db::IndexInfo>, String> {
+    // Query information_schema.STATISTICS row by row (one row per index column,
+    // ordered by SEQ_IN_INDEX).
+    // Docs: https://support.huaweicloud.com/intl/en-us/centralized-m-comp-devg-v8-gaussdb/gaussdb-81-0134.html
+    // The STATISTICS view has no EXPRESSION column in GaussDB M-mode. Expression
+    // indexes are not supported via this path.
+    let sql = format!(
+        "SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE, \
+                INDEX_TYPE, INDEX_COMMENT, SUB_PART \
+         FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+        sql_string(schema),
+        sql_string(table),
+    );
+    log::debug!("[gaussdb-m][list_indexes] sql={sql}");
+
+    let timeout = agent_metadata_timeout(Some(config));
+
+    let result: db::QueryResult = session
+        .invoke_with_timeout(
+            "executeQuery",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "sql": sql,
+                "maxRows": 1000,
+                "fetchSize": 1000,
+                "timeoutSecs": 60,
+            }),
+            timeout,
+        )
+        .await?;
+
+    log::debug!("[gaussdb-m][list_indexes] row_count={}", result.rows.len());
+
+    let col_index: std::collections::HashMap<String, usize> =
+        result.columns.iter().enumerate().map(|(i, name)| (name.to_uppercase(), i)).collect();
+    let get_str = |row: &[serde_json::Value], key: &str| -> String {
+        let upper = key.to_uppercase();
+        col_index.get(&upper).and_then(|&i| row.get(i)).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
+    let get_i64 = |row: &[serde_json::Value], key: &str| -> Option<i64> {
+        let upper = key.to_uppercase();
+        col_index.get(&upper).and_then(|&i| row.get(i)).and_then(|v| v.as_i64())
+    };
+
+    let mut indexes: Vec<db::IndexInfo> = Vec::new();
+    let mut current_name = String::new();
+    let mut current_columns: Vec<String> = Vec::new();
+    let mut current_is_expression: Vec<bool> = Vec::new();
+    let mut current_non_unique: i64 = 1;
+    let mut current_index_type: Option<String> = None;
+    let mut current_comment: Option<String> = None;
+
+    for row in &result.rows {
+        let name = get_str(row, "INDEX_NAME");
+        if name.is_empty() {
+            log::debug!("[gaussdb-m][list_indexes] skipping row with empty INDEX_NAME: {:?}", row);
+            continue;
+        }
+
+        if name != current_name {
+            // Finalize previous index
+            if !current_name.is_empty() {
+                let is_primary =
+                    current_name.to_lowercase().ends_with("_pkey") || current_name.eq_ignore_ascii_case("primary");
+                indexes.push(db::IndexInfo {
+                    name: current_name.clone(),
+                    columns: current_columns.clone(),
+                    is_unique: current_non_unique == 0,
+                    is_primary,
+                    filter: None,
+                    index_type: current_index_type.clone(),
+                    included_columns: None,
+                    comment: current_comment.clone(),
+                    key_is_expression: current_is_expression.clone(),
+                    column_opclasses: vec![],
+                    key_options: Vec::new(),
+                    constraint_backed: false,
+                });
+            }
+            // Start new index
+            current_name = name;
+            current_columns = Vec::new();
+            current_is_expression = Vec::new();
+            current_non_unique = get_i64(row, "NON_UNIQUE").unwrap_or(1);
+            current_index_type = {
+                let t = get_str(row, "INDEX_TYPE");
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            };
+            current_comment = {
+                let c = get_str(row, "INDEX_COMMENT");
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
+            };
+        }
+
+        // Build column name with prefix/sub_part suffix
+        let column_name = get_str(row, "COLUMN_NAME");
+        if column_name.is_empty() {
+            continue;
+        }
+
+        // SUB_PART is bigint in STATISTICS; JDBC plugin sends it as JSON number,
+        // but may also be null or string.
+        let sub_part: String = col_index
+            .get("SUB_PART")
+            .and_then(|&i| row.get(i))
+            .and_then(|v| {
+                if v.is_null() {
+                    None
+                } else if let Some(n) = v.as_i64() {
+                    Some(n.to_string())
+                } else {
+                    v.as_str().map(|s| s.to_string())
+                }
+            })
+            .unwrap_or_default();
+
+        if !sub_part.is_empty() && sub_part != "0" && sub_part != "NULL" {
+            // Prefix index: COLUMN_NAME(SUB_PART) like "name(10)"
+            current_columns.push(format!("{}({})", column_name, sub_part));
+        } else {
+            current_columns.push(column_name);
+        }
+        current_is_expression.push(false);
+    }
+
+    // Finalize last index
+    if !current_name.is_empty() {
+        let is_primary = current_name.to_lowercase().ends_with("_pkey") || current_name.eq_ignore_ascii_case("primary");
+        indexes.push(db::IndexInfo {
+            name: current_name,
+            columns: current_columns,
+            is_unique: current_non_unique == 0,
+            is_primary,
+            filter: None,
+            index_type: current_index_type,
+            included_columns: None,
+            comment: current_comment,
+            key_is_expression: current_is_expression,
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        });
+    }
+
+    Ok(indexes)
 }
 
 fn gaussdb_m_view_object_source_sql(
@@ -7264,6 +8658,7 @@ fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
         | db::ObjectSourceKind::Event
         | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Synonym
+        | db::ObjectSourceKind::Job
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
         | db::ObjectSourceKind::Type
@@ -7280,6 +8675,7 @@ fn sqlserver_object_type_filter(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::Event
         | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Synonym
+        | db::ObjectSourceKind::Job
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
         | db::ObjectSourceKind::Type
@@ -7306,7 +8702,7 @@ pub fn postgres_object_source_sql(
     kind: &db::ObjectSourceKind,
     signature: Option<&str>,
 ) -> String {
-    postgres_object_source_sql_inner(schema, name, kind, signature, true, false)
+    postgres_object_source_sql_inner(schema, name, kind, signature, true, false, true)
 }
 
 fn postgres_trigger_object_source_sql(schema: &str, name: &str, relation_name: Option<&str>) -> String {
@@ -7333,7 +8729,7 @@ fn opengauss_object_source_sql(
     kind: &db::ObjectSourceKind,
     signature: Option<&str>,
 ) -> String {
-    postgres_object_source_sql_inner(schema, name, kind, signature, true, true)
+    postgres_object_source_sql_inner(schema, name, kind, signature, true, true, false)
 }
 
 fn opengauss_sequence_object_source_sql(schema: &str, name: &str, include_cache: bool) -> String {
@@ -7376,13 +8772,35 @@ fn opengauss_sequence_object_source_sql(schema: &str, name: &str, include_cache:
     )
 }
 
-fn postgres_object_source_sql_without_relispopulated(
+/// Servers without `pg_get_function_identity_arguments` (Redshift-compatible,
+/// some legacy PostgreSQL forks like TBase) have their object *list* signature
+/// built with the older `pg_get_function_arguments` formatter instead, which
+/// includes `DEFAULT ...` clauses for parameters with default values. Matching
+/// that signature against `pg_get_function_identity_arguments` (which never
+/// includes `DEFAULT` clauses) then always misses for routines with default
+/// parameters. This mirrors the signature filter but uses the same legacy
+/// formatter so it matches what the list query actually produced.
+fn postgres_function_object_source_sql_with_legacy_signature(
     schema: &str,
     name: &str,
     kind: &db::ObjectSourceKind,
     signature: Option<&str>,
 ) -> String {
-    postgres_object_source_sql_inner(schema, name, kind, signature, false, false)
+    let prokind = if matches!(kind, db::ObjectSourceKind::Procedure) { "p" } else { "f" };
+    let signature_filter = signature
+        .map(|value| format!(" AND pg_get_function_arguments(p.oid) = {}", sql_string(value)))
+        .unwrap_or_default();
+    format!(
+        "SELECT pg_get_functiondef(p.oid) \
+         FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = {} AND p.proname = {} AND p.prokind = '{}'{} \
+         ORDER BY p.oid LIMIT 1",
+        sql_string(schema),
+        sql_string(name),
+        prokind,
+        signature_filter
+    )
 }
 
 fn postgres_function_object_source_sql_without_prokind(
@@ -7438,6 +8856,7 @@ fn postgres_object_source_sql_inner(
     signature: Option<&str>,
     include_relispopulated: bool,
     unwrap_opengauss_record: bool,
+    isolate_view_search_path: bool,
 ) -> String {
     match kind {
         db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => {
@@ -7446,20 +8865,35 @@ fn postgres_object_source_sql_inner(
             } else {
                 ""
             };
-            let materialized_viewdef = "regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '')";
+            let viewdef = if isolate_view_search_path {
+                "pg_catalog.pg_get_viewdef(c.oid, 0)"
+            } else {
+                "pg_get_viewdef(c.oid, 0)"
+            };
+            let regexp_replace = if isolate_view_search_path { "pg_catalog.regexp_replace" } else { "regexp_replace" };
+            let format_fn = if isolate_view_search_path { "pg_catalog.format" } else { "format" };
+            let materialized_viewdef = format!("{regexp_replace}({viewdef}, ';[[:space:]]*$', '')");
             let materialized_source_expr = format!(
                 "CASE WHEN {materialized_viewdef} ~* '^[[:space:]]*CREATE[[:space:]]+(OR[[:space:]]+REPLACE[[:space:]]+)?MATERIALIZED[[:space:]]+VIEW[[:space:]]+' \
                  THEN {materialized_viewdef} \
-                 ELSE format('CREATE MATERIALIZED VIEW %I.%I AS ', n.nspname, c.relname) || {materialized_viewdef}{materialized_populated_clause} \
+                 ELSE {format_fn}('CREATE MATERIALIZED VIEW %I.%I AS ', n.nspname, c.relname) || {materialized_viewdef}{materialized_populated_clause} \
                  END"
             );
+            let search_path_cte = if isolate_view_search_path {
+                "WITH dbx_search_path AS (SELECT pg_catalog.set_config('search_path', '', true) AS applied) "
+            } else {
+                ""
+            };
+            let search_path_join = if isolate_view_search_path { " CROSS JOIN dbx_search_path path_guard" } else { "" };
+            let search_path_guard = if isolate_view_search_path { " AND path_guard.applied IS NOT NULL" } else { "" };
             format!(
-                "SELECT CASE WHEN c.relkind = 'm' THEN {} \
-                 ELSE format('CREATE OR REPLACE VIEW %I.%I AS ', n.nspname, c.relname) || pg_get_viewdef(c.oid, 0) \
+                "{search_path_cte}SELECT CASE WHEN c.relkind = 'm' THEN {} \
+                 ELSE {format_fn}('CREATE OR REPLACE VIEW %I.%I AS ', n.nspname, c.relname) || {viewdef} \
                  END \
                  FROM pg_catalog.pg_class c \
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = {} AND c.relname = {} AND c.relkind IN ('v','m') \
+                 {search_path_join} \
+                 WHERE n.nspname = {} AND c.relname = {} AND c.relkind IN ('v','m'){search_path_guard} \
                  ORDER BY c.oid LIMIT 1",
                 materialized_source_expr,
                 sql_string(schema),
@@ -7518,6 +8952,7 @@ fn postgres_object_source_sql_inner(
         db::ObjectSourceKind::Trigger
         | db::ObjectSourceKind::Event
         | db::ObjectSourceKind::Synonym
+        | db::ObjectSourceKind::Job
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
         | db::ObjectSourceKind::Type
@@ -7526,6 +8961,12 @@ fn postgres_object_source_sql_inner(
 }
 
 pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
+    // Scheduler jobs are currently an Xugu-specific Agent object. Do not
+    // manufacture an Oracle DBMS_METADATA request for a kind Oracle does not
+    // expose through this generic source-SQL helper.
+    if matches!(kind, db::ObjectSourceKind::Job) {
+        return String::new();
+    }
     let object_type = match kind {
         db::ObjectSourceKind::View => "VIEW",
         db::ObjectSourceKind::MaterializedView => "MATERIALIZED_VIEW",
@@ -7535,6 +8976,7 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
         db::ObjectSourceKind::Event => "EVENT",
         db::ObjectSourceKind::Sequence => "SEQUENCE",
         db::ObjectSourceKind::Synonym => "SYNONYM",
+        db::ObjectSourceKind::Job => "",
         db::ObjectSourceKind::Package => "PACKAGE",
         db::ObjectSourceKind::PackageBody => "PACKAGE_BODY",
         db::ObjectSourceKind::Type => "TYPE",
@@ -7592,6 +9034,7 @@ pub fn mysql_object_source_sql(database: &str, name: &str, kind: &db::ObjectSour
         db::ObjectSourceKind::Event => format!("SHOW CREATE EVENT {qualified_name}"),
         db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Synonym
+        | db::ObjectSourceKind::Job
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
         | db::ObjectSourceKind::Type
@@ -7628,6 +9071,7 @@ pub(crate) fn mysql_object_source_ddl_column_index(kind: &db::ObjectSourceKind) 
         | db::ObjectSourceKind::Trigger
         | db::ObjectSourceKind::Sequence
         | db::ObjectSourceKind::Synonym
+        | db::ObjectSourceKind::Job
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
         | db::ObjectSourceKind::Type
@@ -7636,15 +9080,32 @@ pub(crate) fn mysql_object_source_ddl_column_index(kind: &db::ObjectSourceKind) 
     }
 }
 
+fn postgres_view_source_fallback_sql_inner(schema: &str, name: &str, isolate_search_path: bool) -> String {
+    if isolate_search_path {
+        format!(
+            "WITH dbx_search_path AS (SELECT pg_catalog.set_config('search_path', '', true) AS applied) \
+             SELECT v.definition \
+             FROM pg_catalog.pg_views v \
+             CROSS JOIN dbx_search_path path_guard \
+             WHERE v.schemaname = {} AND v.viewname = {} AND path_guard.applied IS NOT NULL \
+             LIMIT 1",
+            sql_string(schema),
+            sql_string(name)
+        )
+    } else {
+        format!(
+            "SELECT definition \
+             FROM pg_catalog.pg_views \
+             WHERE schemaname = {} AND viewname = {} \
+             LIMIT 1",
+            sql_string(schema),
+            sql_string(name)
+        )
+    }
+}
+
 pub fn postgres_view_source_fallback_sql(schema: &str, name: &str) -> String {
-    format!(
-        "SELECT definition \
-         FROM pg_catalog.pg_views \
-         WHERE schemaname = {} AND viewname = {} \
-         LIMIT 1",
-        sql_string(schema),
-        sql_string(name)
-    )
+    postgres_view_source_fallback_sql_inner(schema, name, true)
 }
 
 fn first_string_cell(result: db::QueryResult) -> Result<String, String> {
@@ -7811,10 +9272,9 @@ async fn get_custom_type_details_once(
         return Err(format!("custom type details are not supported for {:?} connections", config.db_type));
     }
     {
-        let connections = state.connections.read().await;
-        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
             let timeout_duration = agent_metadata_timeout(db_config.as_ref());
-            drop(connections);
             let mut client = client.lock().await;
             return client
                 .get_custom_type_details::<db::CustomTypeDetails>(database, schema, name, timeout_duration)
@@ -7854,6 +9314,59 @@ pub async fn get_object_source_core(
     Ok(finalize_object_source(source))
 }
 
+pub async fn get_event_info_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    _schema: &str,
+    name: &str,
+) -> Result<db::MysqlEventInfo, String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    match pool {
+        PoolKind::Mysql(pool, _) => db::mysql::get_event_info(&pool, database, name).await,
+        PoolKind::ExternalDriver { config, session, .. } => {
+            let quote = |value: &str| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+            let sql = format!("SELECT EVENT_SCHEMA, EVENT_NAME, DEFINER, TIME_ZONE, EVENT_TYPE, EXECUTE_AT, INTERVAL_VALUE, INTERVAL_FIELD, STARTS, ENDS, STATUS, ON_COMPLETION, EVENT_COMMENT, EVENT_DEFINITION, CREATED, LAST_ALTERED, LAST_EXECUTED FROM information_schema.EVENTS WHERE EVENT_SCHEMA = {} AND EVENT_NAME = {} LIMIT 1", quote(database), quote(name));
+            let result: db::QueryResult = session.invoke_with_timeout("executeQuery", serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": _schema, "sql": sql, "maxRows": 1 }), agent_metadata_timeout(Some(&config))).await?;
+            let row = result.rows.first().ok_or_else(|| format!("MySQL event not found: {database}.{name}"))?;
+            let text = |column: &str| {
+                result.columns.iter().position(|c| c.eq_ignore_ascii_case(column)).and_then(|i| row.get(i)).and_then(
+                    |v| {
+                        if v.is_null() {
+                            None
+                        } else {
+                            Some(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                        }
+                    },
+                )
+            };
+            Ok(db::MysqlEventInfo {
+                name: text("EVENT_NAME").unwrap_or_else(|| name.to_string()),
+                schema: text("EVENT_SCHEMA").unwrap_or_else(|| database.to_string()),
+                definer: text("DEFINER"),
+                time_zone: text("TIME_ZONE"),
+                event_type: text("EVENT_TYPE"),
+                execute_at: text("EXECUTE_AT"),
+                interval_value: text("INTERVAL_VALUE"),
+                interval_field: text("INTERVAL_FIELD"),
+                starts: text("STARTS"),
+                ends: text("ENDS"),
+                status: text("STATUS"),
+                on_completion: text("ON_COMPLETION"),
+                comment: text("EVENT_COMMENT"),
+                event_body: text("EVENT_DEFINITION"),
+                event_definition: text("EVENT_DEFINITION"),
+                created_at: text("CREATED"),
+                updated_at: text("LAST_ALTERED"),
+                last_executed: text("LAST_EXECUTED"),
+                source: None,
+            })
+        }
+        _ => Err("MySQL event details are only supported for MySQL connections".into()),
+    }
+}
+
 fn finalize_object_source(mut source: db::ObjectSource) -> db::ObjectSource {
     if matches!(source.object_type, db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function) {
         source.source = normalize_routine_object_source(source.source);
@@ -7877,11 +9390,10 @@ async fn get_object_source_once(
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
     let db_config = connection_config(state, connection_id).await;
     let source = {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             if let Some(sql) = gaussdb_m_view_object_source_sql(config.as_ref(), database, schema, name, &object_type) {
                 let result: db::QueryResult = session
                     .invoke_with_timeout(
@@ -7920,8 +9432,7 @@ async fn get_object_source_once(
                 .await?;
             return Ok(result);
         }
-        if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
-            drop(connections);
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), SqlServer) {
             let mut client = lock_sqlserver_metadata_client(&client).await?;
             let result =
                 db::sqlserver::execute_query(&mut client, &sqlserver_object_source_sql(schema, name, &object_type))
@@ -7932,11 +9443,8 @@ async fn get_object_source_once(
                 state.remove_pool_by_key(&pool_key).await;
             }
             first_string_cell(result?)?
-        } else if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-            drop(connections);
-            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle)
-                && matches!(object_type, db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody)
-            {
+        } else if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
+            if uses_oracle_metadata_object_source(db_config.as_ref(), &object_type) {
                 oracle_agent_object_source(
                     client,
                     database,
@@ -7961,7 +9469,7 @@ async fn get_object_source_once(
                 return Ok(result);
             }
         } else {
-            match connections.get(&pool_key).ok_or("Pool not found")? {
+            match pool_handle.as_ref().ok_or("Pool not found")? {
                 PoolKind::Mysql(pool, _) => {
                     mysql_object_source(pool, mysql_table_metadata_catalog(database, schema), name, &object_type)
                         .await?
@@ -7972,6 +9480,9 @@ async fn get_object_source_once(
                 }
                 PoolKind::Postgres(pool) => {
                     let unwrap_opengauss_record = db_config.as_ref().is_some_and(is_opengauss_family_config);
+                    let isolate_view_search_path = postgres_view_source_uses_isolated_search_path(
+                        db_config.as_ref().map(|config| &config.db_type),
+                    );
                     postgres_object_source(
                         pool,
                         schema,
@@ -7980,6 +9491,7 @@ async fn get_object_source_once(
                         signature,
                         relation_name,
                         unwrap_opengauss_record,
+                        isolate_view_search_path,
                     )
                     .await?
                 }
@@ -7991,7 +9503,6 @@ async fn get_object_source_once(
                     let schema = schema.to_string();
                     let name = name.to_string();
                     let object_type = object_type.clone();
-                    drop(connections);
                     client.get_object_source(database, schema, name, object_type).await?
                 }
                 PoolKind::Rqlite(client) => {
@@ -8060,8 +9571,8 @@ pub fn oracle_list_objects_sql(schema: &str) -> String {
     format!(
         "SELECT object_name, CASE object_type WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE object_type END AS object_type, owner \
          FROM all_objects \
-         WHERE owner = {} AND object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY') \
-         ORDER BY CASE object_type WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 WHEN 'FUNCTION' THEN 3 WHEN 'PACKAGE' THEN 4 ELSE 5 END, object_name",
+         WHERE owner = {} AND object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'SEQUENCE', 'PACKAGE', 'PACKAGE BODY') \
+         ORDER BY CASE object_type WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 WHEN 'FUNCTION' THEN 3 WHEN 'SEQUENCE' THEN 4 WHEN 'PACKAGE' THEN 5 ELSE 6 END, object_name",
         oracle_owner_filter(schema)
     )
 }
@@ -8345,6 +9856,10 @@ async fn db2_column_comments(
     comments
 }
 
+fn postgres_view_source_uses_isolated_search_path(database_type: Option<&DatabaseType>) -> bool {
+    database_type == Some(&DatabaseType::Postgres)
+}
+
 async fn postgres_object_source(
     pool: &deadpool_postgres::Pool,
     schema: &str,
@@ -8353,13 +9868,16 @@ async fn postgres_object_source(
     signature: Option<&str>,
     relation_name: Option<&str>,
     unwrap_opengauss_record: bool,
+    isolate_view_search_path: bool,
 ) -> Result<String, String> {
     let sql = if matches!(object_type, db::ObjectSourceKind::Trigger) {
         postgres_trigger_object_source_sql(schema, name, relation_name)
     } else if unwrap_opengauss_record {
         opengauss_object_source_sql(schema, name, object_type, signature)
-    } else {
+    } else if isolate_view_search_path {
         postgres_object_source_sql(schema, name, object_type, signature)
+    } else {
+        postgres_object_source_sql_inner(schema, name, object_type, signature, true, false, false)
     };
     match db::postgres::execute_query(pool, &sql).await.and_then(first_string_cell) {
         Ok(source) => Ok(source),
@@ -8367,7 +9885,15 @@ async fn postgres_object_source(
             if postgres_missing_relispopulated_error(&primary_err)
                 && matches!(object_type, db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView) =>
         {
-            let fallback_sql = postgres_object_source_sql_without_relispopulated(schema, name, object_type, signature);
+            let fallback_sql = postgres_object_source_sql_inner(
+                schema,
+                name,
+                object_type,
+                signature,
+                false,
+                false,
+                isolate_view_search_path,
+            );
             db::postgres::execute_query(pool, &fallback_sql)
                 .await
                 .and_then(first_string_cell)
@@ -8409,8 +9935,21 @@ async fn postgres_object_source(
                 .and_then(first_string_cell)
                 .map_err(|fallback_err| format!("{primary_err}; prokind fallback failed: {fallback_err}"))
         }
+        Err(primary_err)
+            if !unwrap_opengauss_record
+                && primary_err == "Object source not found"
+                && signature.is_some()
+                && matches!(object_type, db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function) =>
+        {
+            let fallback_sql =
+                postgres_function_object_source_sql_with_legacy_signature(schema, name, object_type, signature);
+            db::postgres::execute_query(pool, &fallback_sql)
+                .await
+                .and_then(first_string_cell)
+                .map_err(|fallback_err| format!("{primary_err}; legacy signature fallback failed: {fallback_err}"))
+        }
         Err(primary_err) if matches!(object_type, db::ObjectSourceKind::View) => {
-            let fallback_sql = postgres_view_source_fallback_sql(schema, name);
+            let fallback_sql = postgres_view_source_fallback_sql_inner(schema, name, isolate_view_search_path);
             db::postgres::execute_query(pool, &fallback_sql)
                 .await
                 .and_then(first_string_cell)
@@ -8422,10 +9961,18 @@ async fn postgres_object_source(
 
 fn postgres_missing_prokind_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
-    lower.contains("does not exist")
-        && (lower.contains("column p.prokind")
-            || lower.contains("column \"p\".\"prokind\"")
-            || lower.contains("column \"prokind\""))
+    let mentions_prokind =
+        lower.contains("p.prokind") || lower.contains("\"p\".\"prokind\"") || lower.contains("\"prokind\"");
+    if !mentions_prokind {
+        return false;
+    }
+
+    // PostgreSQL localizes the undefined-column message (for example, Chinese
+    // servers report "字段 p.prokind 不存在"). Keep the column context so an
+    // unrelated relation named `prokind` cannot trigger this compatibility path.
+    lower.contains("sqlstate 42703")
+        || (lower.contains("does not exist") && lower.contains("column"))
+        || (err.contains("不存在") && (err.contains("字段") || err.contains("列 p.prokind")))
 }
 
 fn opengauss_sequence_cache_metadata_error(err: &str) -> bool {
@@ -8485,6 +10032,11 @@ mod object_source_tests {
     fn builds_postgres_object_source_sql_for_views_and_functions() {
         let view_sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::View, None);
 
+        assert!(view_sql
+            .starts_with("WITH dbx_search_path AS (SELECT pg_catalog.set_config('search_path', '', true) AS applied)"));
+        assert!(view_sql.contains("pg_catalog.pg_get_viewdef(c.oid, 0)"));
+        assert!(view_sql.contains("CROSS JOIN dbx_search_path path_guard"));
+        assert!(view_sql.contains("path_guard.applied IS NOT NULL"));
         assert!(view_sql.contains("CREATE MATERIALIZED VIEW"));
         assert!(view_sql.contains("CREATE OR REPLACE VIEW"));
         assert!(view_sql.contains("CASE WHEN c.relispopulated THEN ' WITH DATA' ELSE ' WITH NO DATA' END"));
@@ -8500,6 +10052,39 @@ mod object_source_tests {
             postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function, Some("integer, integer")),
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'f' AND pg_get_function_identity_arguments(p.oid) = 'integer, integer' ORDER BY p.oid LIMIT 1"
         );
+
+        assert_eq!(
+            postgres_function_object_source_sql_with_legacy_signature(
+                "public",
+                "recalc_score",
+                &ObjectSourceKind::Procedure,
+                Some("i_id numeric DEFAULT 0, OUT o_code integer"),
+            ),
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'p' AND pg_get_function_arguments(p.oid) = 'i_id numeric DEFAULT 0, OUT o_code integer' ORDER BY p.oid LIMIT 1"
+        );
+
+        let opengauss_view_sql = opengauss_object_source_sql("public", "active_users", &ObjectSourceKind::View, None);
+        assert!(!opengauss_view_sql.contains("set_config('search_path'"));
+
+        let compatible_view_sql = postgres_object_source_sql_inner(
+            "public",
+            "active_users",
+            &ObjectSourceKind::View,
+            None,
+            true,
+            false,
+            false,
+        );
+        assert!(!compatible_view_sql.contains("set_config('search_path'"));
+    }
+
+    #[test]
+    fn isolates_view_search_path_only_for_native_postgres() {
+        assert!(postgres_view_source_uses_isolated_search_path(Some(&DatabaseType::Postgres)));
+        assert!(!postgres_view_source_uses_isolated_search_path(Some(&DatabaseType::Redshift)));
+        assert!(!postgres_view_source_uses_isolated_search_path(Some(&DatabaseType::OpenGauss)));
+        assert!(!postgres_view_source_uses_isolated_search_path(Some(&DatabaseType::Kingbase)));
+        assert!(!postgres_view_source_uses_isolated_search_path(None));
     }
 
     #[test]
@@ -8515,15 +10100,20 @@ mod object_source_tests {
 
     #[test]
     fn builds_postgres_object_source_sql_without_relispopulated_for_legacy_catalogs() {
-        let sql = postgres_object_source_sql_without_relispopulated(
+        let sql = postgres_object_source_sql_inner(
             "public",
             "active_users",
             &ObjectSourceKind::MaterializedView,
             None,
+            false,
+            false,
+            true,
         );
 
         assert!(sql.contains("CREATE MATERIALIZED VIEW"));
-        assert!(sql.contains("pg_get_viewdef(c.oid, 0)"));
+        assert!(sql.contains("pg_catalog.pg_get_viewdef(c.oid, 0)"));
+        assert!(sql.contains("pg_catalog.set_config('search_path', '', true)"));
+        assert!(sql.contains("path_guard.applied IS NOT NULL"));
         assert!(!sql.contains("relispopulated"));
     }
 
@@ -8660,7 +10250,7 @@ mod object_source_tests {
             )
         );
         assert!(sql.contains(
-            "THEN regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '') ELSE format('CREATE MATERIALIZED VIEW"
+            "THEN pg_catalog.regexp_replace(pg_catalog.pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '') ELSE pg_catalog.format('CREATE MATERIALIZED VIEW"
         ));
     }
 
@@ -8674,7 +10264,11 @@ mod object_source_tests {
     fn detects_legacy_postgres_prokind_errors() {
         assert!(postgres_missing_prokind_error("ERROR: column p.prokind does not exist"));
         assert!(postgres_missing_prokind_error("ERROR: column \"p\".\"prokind\" does not exist"));
+        assert!(postgres_missing_prokind_error("错误: 字段 p.prokind 不存在\n提示: 也许您想要引用列 \"p.probin\"。"));
+        assert!(postgres_missing_prokind_error("ERROR: undefined column p.prokind (SQLSTATE 42703)"));
         assert!(!postgres_missing_prokind_error("ERROR: relation public.prokind does not exist"));
+        assert!(!postgres_missing_prokind_error("错误: 关系 public.prokind 不存在\n提示: 请检查列 p.probin。"));
+        assert!(!postgres_missing_prokind_error("ERROR: permission denied for column p.prokind"));
     }
 
     #[test]
@@ -8693,6 +10287,10 @@ mod object_source_tests {
     fn builds_postgres_view_source_fallback_sql_from_pg_views() {
         assert_eq!(
             postgres_view_source_fallback_sql("tenant's schema", "active users"),
+            "WITH dbx_search_path AS (SELECT pg_catalog.set_config('search_path', '', true) AS applied) SELECT v.definition FROM pg_catalog.pg_views v CROSS JOIN dbx_search_path path_guard WHERE v.schemaname = 'tenant''s schema' AND v.viewname = 'active users' AND path_guard.applied IS NOT NULL LIMIT 1"
+        );
+        assert_eq!(
+            postgres_view_source_fallback_sql_inner("tenant's schema", "active users", false),
             "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'tenant''s schema' AND viewname = 'active users' LIMIT 1"
         );
     }
@@ -8711,6 +10309,11 @@ mod object_source_tests {
             oracle_object_source_sql("", "PAYROLL", &ObjectSourceKind::Package),
             "SELECT DBMS_METADATA.GET_DDL('PACKAGE', 'PAYROLL') FROM DUAL"
         );
+        assert_eq!(
+            oracle_object_source_sql("HR", "ORDER_SEQ", &ObjectSourceKind::Sequence),
+            "SELECT DBMS_METADATA.GET_DDL('SEQUENCE', 'ORDER_SEQ', 'HR') FROM DUAL"
+        );
+        assert_eq!(oracle_object_source_sql("HR", "NIGHTLY_JOB", &ObjectSourceKind::Job), "");
     }
 
     #[test]
@@ -8719,6 +10322,7 @@ mod object_source_tests {
 
         assert!(sql.contains("'PACKAGE'"));
         assert!(sql.contains("'PACKAGE BODY'"));
+        assert!(sql.contains("'SEQUENCE'"));
         assert!(sql.contains("CASE object_type WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY'"));
         assert!(sql.contains("owner = 'HR'"));
     }
@@ -8958,6 +10562,113 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_table_ddl_preserves_named_unique_and_primary_constraints() {
+        let mut id = column("id", "bigint");
+        id.is_nullable = false;
+        id.is_primary_key = true;
+        let indexes = vec![
+            db::IndexInfo {
+                name: "pk_accounts".to_string(),
+                columns: vec!["id".to_string()],
+                is_unique: true,
+                is_primary: true,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: true,
+            },
+            db::IndexInfo {
+                name: "uq_accounts_code".to_string(),
+                columns: vec!["code".to_string()],
+                is_unique: true,
+                is_primary: false,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: true,
+            },
+            db::IndexInfo {
+                name: "idx_accounts_display_name".to_string(),
+                columns: vec!["display_name".to_string()],
+                is_unique: true,
+                is_primary: false,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: false,
+            },
+        ];
+        let constraints = vec![
+            db::ConstraintInfo {
+                name: "pk_accounts".to_string(),
+                constraint_type: "PRIMARY KEY".to_string(),
+                definition: "PRIMARY KEY (id)".to_string(),
+                columns: vec!["id".to_string()],
+                ref_schema: None,
+                ref_table: None,
+                ref_columns: Vec::new(),
+                match_type: None,
+                on_update: None,
+                on_delete: None,
+                deferrable: false,
+                initially_deferred: false,
+                enabled: true,
+                valid: true,
+            },
+            db::ConstraintInfo {
+                name: "uq_accounts_code".to_string(),
+                constraint_type: "UNIQUE".to_string(),
+                definition: "UNIQUE (code) DEFERRABLE INITIALLY DEFERRED".to_string(),
+                columns: vec!["code".to_string()],
+                ref_schema: None,
+                ref_table: None,
+                ref_columns: Vec::new(),
+                match_type: None,
+                on_update: None,
+                on_delete: None,
+                deferrable: true,
+                initially_deferred: true,
+                enabled: true,
+                valid: true,
+            },
+        ];
+
+        let ddl = render_postgres_table_ddl_with_constraints_and_partition_info(
+            "public",
+            "accounts",
+            &[id],
+            &indexes,
+            &[],
+            &constraints,
+            &[],
+            None,
+            &db::postgres::PostgresTablePartitionInfo::default(),
+            &db::postgres::PostgresTablePartitionLocalObjects::default(),
+        );
+
+        assert!(ddl.contains("CONSTRAINT \"pk_accounts\" PRIMARY KEY (id)"), "ddl: {ddl}");
+        assert!(
+            ddl.contains("CONSTRAINT \"uq_accounts_code\" UNIQUE (code) DEFERRABLE INITIALLY DEFERRED"),
+            "ddl: {ddl}"
+        );
+        assert!(!ddl.contains("CREATE UNIQUE INDEX \"pk_accounts\""), "ddl: {ddl}");
+        assert!(!ddl.contains("CREATE UNIQUE INDEX \"uq_accounts_code\""), "ddl: {ddl}");
+        assert!(ddl.contains("CREATE UNIQUE INDEX \"idx_accounts_display_name\""), "ddl: {ddl}");
+    }
+
+    #[test]
     fn postgres_table_ddl_renders_owned_serial_markers_without_external_defaults() {
         for (column_name, data_type, serial_type) in [
             ("small\"id", "smallint", "smallserial"),
@@ -9047,6 +10758,37 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_table_ddl_appends_opclass_to_expression_index_key() {
+        // The per-column `pg_get_indexdef(indexrelid, colno, pretty)` returns only the
+        // bare expression (PostgreSQL sets `attrsOnly = (colno != 0)`, so the opclass
+        // block is skipped — see `ruleutils.c`). The opclass is read separately from
+        // `indclass` into `column_opclasses`, so table DDL must append it to an
+        // expression key just like a real column.
+        let id = column("id", "integer");
+        let indexes = vec![db::IndexInfo {
+            name: "users_lower_email_trgm_idx".to_string(),
+            columns: vec!["lower(email)".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: Some("gin".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![true],
+            column_opclasses: vec![Some("gin_trgm_ops".to_string())],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let ddl = render_postgres_table_ddl("public", "users", &[id], &indexes, &[], None);
+
+        assert!(
+            ddl.contains("USING gin (lower(email) gin_trgm_ops)"),
+            "expected expression key with appended opclass, got: {ddl}"
+        );
+    }
+
+    #[test]
     fn postgres_table_ddl_renders_partition_children_and_subpartitions() {
         let mut id = column("id", "integer");
         id.is_primary_key = true;
@@ -9060,6 +10802,9 @@ mod ddl_tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         }];
         let partition_info = db::postgres::PostgresTablePartitionInfo {
             is_partition: true,
@@ -9097,6 +10842,68 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_partition_ddl_preserves_local_unique_without_local_primary_key() {
+        let indexes = vec![db::IndexInfo {
+            name: "events_2026_code_key".to_string(),
+            columns: vec!["code".to_string()],
+            is_unique: true,
+            is_primary: false,
+            filter: None,
+            index_type: Some("btree".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: Vec::new(),
+            column_opclasses: Vec::new(),
+            key_options: Vec::new(),
+            constraint_backed: true,
+        }];
+        let constraints = vec![db::ConstraintInfo {
+            name: "events_2026_code_key".to_string(),
+            constraint_type: "UNIQUE".to_string(),
+            definition: "UNIQUE (code)".to_string(),
+            columns: vec!["code".to_string()],
+            ref_schema: None,
+            ref_table: None,
+            ref_columns: Vec::new(),
+            match_type: None,
+            on_update: None,
+            on_delete: None,
+            deferrable: false,
+            initially_deferred: false,
+            enabled: true,
+            valid: true,
+        }];
+        let partition_info = db::postgres::PostgresTablePartitionInfo {
+            is_partition: true,
+            parent_schema: Some("public".to_string()),
+            parent_table: Some("events".to_string()),
+            bound: Some("DEFAULT".to_string()),
+            ..Default::default()
+        };
+        let partition_local_objects = db::postgres::PostgresTablePartitionLocalObjects {
+            unique_constraints: BTreeSet::from(["events_2026_code_key".to_string()]),
+            indexes: BTreeSet::from(["events_2026_code_key".to_string()]),
+            ..Default::default()
+        };
+
+        let ddl = render_postgres_table_ddl_with_constraints_and_partition_info(
+            "public",
+            "events_2026",
+            &[column("code", "text")],
+            &indexes,
+            &[],
+            &constraints,
+            &[],
+            None,
+            &partition_info,
+            &partition_local_objects,
+        );
+
+        assert!(ddl.contains("CONSTRAINT \"events_2026_code_key\" UNIQUE (code)"), "ddl: {ddl}");
+        assert!(!ddl.contains("CREATE UNIQUE INDEX"), "ddl: {ddl}");
+    }
+
+    #[test]
     fn postgres_partition_ddl_skips_inherited_constraints_and_indexes() {
         let mut id = column("id", "integer");
         id.is_primary_key = true;
@@ -9110,6 +10917,9 @@ mod ddl_tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         }];
         let partition_info = db::postgres::PostgresTablePartitionInfo {
             is_partition: true,
@@ -9447,6 +11257,40 @@ mod ddl_tests {
     }
 
     #[test]
+    fn opengauss_ddl_comment_normalization_escapes_unescaped_quotes() {
+        // openGauss 6.x pg_get_tabledef concatenates the stored comment into
+        // the COMMENT ON literal verbatim; embedded single quotes make the
+        // statement invalid. Everything downstream (transfer table creation,
+        // export, UI display) executes this DDL, so the quotes must be doubled.
+        let ddl = concat!(
+            "SET search_path = public;\n",
+            "CREATE TABLE \"public\".\"dpms_doctor_surgery_record\" (\"del_flag\" char(1));\n",
+            "COMMENT ON COLUMN \"public\".\"dpms_doctor_surgery_record\".\"del_flag\" IS '逻辑删除标志：'0'-未删除，'1'-已删除';"
+        );
+
+        assert_eq!(
+            normalize_opengauss_table_ddl_comments(ddl),
+            concat!(
+                "SET search_path = public;\n",
+                "CREATE TABLE \"public\".\"dpms_doctor_surgery_record\" (\"del_flag\" char(1));\n",
+                "COMMENT ON COLUMN \"public\".\"dpms_doctor_surgery_record\".\"del_flag\" IS '逻辑删除标志：''0''-未删除，''1''-已删除';"
+            )
+        );
+    }
+
+    #[test]
+    fn opengauss_ddl_comment_normalization_leaves_valid_ddl_unchanged() {
+        let ddl = concat!(
+            "SET search_path = public;\n",
+            "CREATE TABLE \"public\".\"notes\" (\"body\" text DEFAULT 'O''Hara');\n",
+            "COMMENT ON TABLE \"public\".\"notes\" IS 'owner''s note';\n",
+            "GRANT SELECT ON TABLE \"public\".\"notes\" TO \"auditor's role\";"
+        );
+
+        assert_eq!(normalize_opengauss_table_ddl_comments(ddl), ddl);
+    }
+
+    #[test]
     fn mysql_display_ddl_gets_statement_terminator() {
         let ddl = "CREATE TABLE `users` (\n  `id` int NOT NULL\n) ENGINE=InnoDB";
 
@@ -9719,6 +11563,72 @@ async fn external_driver_mysql_ddl(
     mysql_external_driver_ddl_from_query_result(result, "Create Table")
 }
 
+async fn external_driver_oracle_ddl(
+    session: std::sync::Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, String> {
+    let result: serde_json::Value = session
+        .invoke_with_timeout(
+            "getObjectSource",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "name": table,
+                "object_type": "TABLE",
+            }),
+            agent_metadata_timeout(Some(config)),
+        )
+        .await?;
+    result
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source| !source.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "JDBC Oracle plugin returned no table DDL".to_string())
+}
+
+/// External JDBC connections that match no vendor DDL dialect (JDBCX wrappers,
+/// custom protocol drivers, …) have table DDL rendered by the plugin from
+/// plain `DatabaseMetaData` via `getObjectSource`, mirroring the agent-side
+/// `DdlBuilder` output.
+fn external_driver_uses_generic_ddl(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::Jdbc
+        && !is_oracle_external_driver_config(config)
+        && !external_driver_uses_mysql_ddl(config)
+}
+
+async fn external_driver_jdbc_ddl(
+    session: std::sync::Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, String> {
+    let result: serde_json::Value = session
+        .invoke_with_timeout(
+            "getObjectSource",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "name": table,
+                "object_type": "TABLE",
+            }),
+            agent_metadata_timeout(Some(config)),
+        )
+        .await?;
+    result
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source| !source.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "JDBC plugin returned no table DDL".to_string())
+}
+
 fn normalize_mysql_display_ddl(sql: String) -> String {
     ensure_display_ddl_terminated(repair_mysql_ddl_comments(&sql))
 }
@@ -9842,15 +11752,17 @@ pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, schema: &str, table: &s
 /// duplicate every partition's `CREATE TABLE` (once from the parent's DDL,
 /// once from the caller's own loop over that same child relation).
 pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -> Result<String, String> {
-    let (columns, indexes, fkeys, table_comment, partition_info, trigger_definitions, check_constraints) = tokio::try_join!(
-        db::postgres::get_columns(pool, schema, table),
-        db::postgres::list_indexes(pool, schema, table),
-        db::postgres::list_foreign_keys(pool, schema, table),
-        async { db::postgres::get_table_comment(pool, schema, table).await },
-        db::postgres::get_table_partition_info(pool, schema, table),
-        db::postgres::list_trigger_definitions(pool, schema, table),
-        db::postgres::list_check_constraints(pool, schema, table),
-    )?;
+    let (columns, indexes, fkeys, constraints, table_comment, partition_info, trigger_definitions, check_constraints) =
+        tokio::try_join!(
+            db::postgres::get_columns(pool, schema, table),
+            db::postgres::list_indexes(pool, schema, table),
+            db::postgres::list_foreign_keys(pool, schema, table),
+            db::postgres::list_constraints(pool, schema, table),
+            async { db::postgres::get_table_comment(pool, schema, table).await },
+            db::postgres::get_table_partition_info(pool, schema, table),
+            db::postgres::list_trigger_definitions(pool, schema, table),
+            db::postgres::list_check_constraints(pool, schema, table),
+        )?;
     let partition_local_objects = if partition_info.is_partition {
         db::postgres::get_table_partition_local_objects(pool, schema, table).await?
     } else {
@@ -9858,12 +11770,13 @@ pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -
     };
 
     Ok(append_postgres_trigger_definitions(
-        render_postgres_table_ddl_with_partition_info(
+        render_postgres_table_ddl_with_constraints_and_partition_info(
             schema,
             table,
             &columns,
             &indexes,
             &fkeys,
+            &constraints,
             &check_constraints,
             table_comment.as_deref(),
             &partition_info,
@@ -10256,12 +12169,139 @@ pub async fn opengauss_table_ddl(pool: &deadpool_postgres::Pool, schema: &str, t
         db::postgres::list_trigger_definitions(pool, schema, table),
     )?;
 
+    // Repair the server's comment literals before anything downstream executes
+    // this DDL: every consumer (transfer table creation, export, UI display)
+    // must receive executable SQL, not the raw pg_get_tabledef output.
+    let ddl = normalize_opengauss_table_ddl_comments(&ddl);
     Ok(append_opengauss_trigger_definitions(ddl, &trigger_definitions))
 }
 
 pub fn opengauss_table_ddl_sql(schema: &str, table: &str) -> String {
     let qualified_name = format!("{}.{}", pg_ident(schema), pg_ident(table));
     format!("SELECT pg_get_tabledef({})", sql_string(&qualified_name))
+}
+
+/// openGauss 6.x `pg_get_tabledef` can concatenate comment text into a
+/// `COMMENT ON` literal without escaping embedded single quotes. Normalize
+/// only those generated comment statements; all other DDL text remains
+/// untouched.
+pub(crate) fn normalize_opengauss_table_ddl_comments(ddl: &str) -> String {
+    let mut normalized = String::with_capacity(ddl.len());
+    for line in ddl.split_inclusive('\n') {
+        let (line_body, line_ending) = match line.strip_suffix('\n') {
+            Some(body) => match body.strip_suffix('\r') {
+                Some(body) => (body, "\r\n"),
+                None => (body, "\n"),
+            },
+            None => (line, ""),
+        };
+        let leading = line_body.len() - line_body.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
+        let statement = &line_body[leading..];
+        if let Some(statement) = normalize_opengauss_comment_statement(statement) {
+            normalized.push_str(&line_body[..leading]);
+            normalized.push_str(&statement);
+        } else {
+            normalized.push_str(line_body);
+        }
+        normalized.push_str(line_ending);
+    }
+    normalized
+}
+
+fn normalize_opengauss_comment_statement(statement: &str) -> Option<String> {
+    let uppercase = statement.to_ascii_uppercase();
+    if !uppercase.starts_with("COMMENT ON ") {
+        return None;
+    }
+
+    let is_pos = find_opengauss_comment_is_keyword(statement, &uppercase)?;
+    let value_start = is_pos + " IS ".len();
+    let value = &statement[value_start..];
+    let value_leading = value.len() - value.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
+    let value = &value[value_leading..];
+    let quote_offset = match value.as_bytes() {
+        [b'\'', ..] => 0,
+        [b'e' | b'E', b'\'', ..] => 1,
+        _ => return None,
+    };
+    let opening_quote = value_start + value_leading + quote_offset;
+    let statement_end = statement.trim_end().len();
+    let literal_end = statement[..statement_end]
+        .strip_suffix(';')
+        .map_or(statement_end, |without_terminator| without_terminator.len());
+    if opening_quote >= literal_end {
+        return None;
+    }
+
+    let closing_quote = statement[..literal_end].rfind('\'')?;
+    if closing_quote <= opening_quote || !statement[closing_quote + 1..literal_end].trim().is_empty() {
+        return None;
+    }
+    let literal = &statement[opening_quote..=closing_quote];
+    if opengauss_comment_literal_is_valid(literal) {
+        return Some(statement.to_string());
+    }
+
+    let raw_comment = &statement[opening_quote + 1..closing_quote];
+    let escaped_comment = raw_comment.replace('\'', "''");
+    let mut normalized = String::with_capacity(statement.len() + escaped_comment.len() - raw_comment.len());
+    normalized.push_str(&statement[..opening_quote + 1]);
+    normalized.push_str(&escaped_comment);
+    normalized.push_str(&statement[closing_quote..]);
+    Some(normalized)
+}
+
+fn find_opengauss_comment_is_keyword(statement: &str, uppercase: &str) -> Option<usize> {
+    let mut cursor = "COMMENT ON ".len();
+    while cursor + " IS ".len() <= statement.len() {
+        if statement.as_bytes().get(cursor) == Some(&b'"') {
+            cursor = skip_opengauss_quoted_identifier(statement, cursor);
+            continue;
+        }
+        if uppercase.get(cursor..cursor + " IS ".len()) == Some(" IS ") {
+            return Some(cursor);
+        }
+        cursor += statement[cursor..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn skip_opengauss_quoted_identifier(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
+            if bytes.get(cursor + 1) == Some(&b'"') {
+                cursor += 2;
+            } else {
+                return cursor + 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn opengauss_comment_literal_is_valid(literal: &str) -> bool {
+    let bytes = literal.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'\'') || bytes.last() != Some(&b'\'') {
+        return false;
+    }
+
+    let mut cursor = 1;
+    while cursor < bytes.len() - 1 {
+        if bytes[cursor] == b'\'' {
+            if cursor + 1 < bytes.len() - 1 && bytes[cursor + 1] == b'\'' {
+                cursor += 2;
+            } else {
+                return false;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    true
 }
 
 fn append_postgres_trigger_definitions(mut ddl: String, trigger_definitions: &[String]) -> String {
@@ -10491,6 +12531,32 @@ fn render_postgres_table_ddl_with_partition_info(
     partition_info: &db::postgres::PostgresTablePartitionInfo,
     partition_local_objects: &db::postgres::PostgresTablePartitionLocalObjects,
 ) -> String {
+    render_postgres_table_ddl_with_constraints_and_partition_info(
+        schema,
+        table,
+        columns,
+        indexes,
+        fkeys,
+        &[],
+        check_constraints,
+        table_comment,
+        partition_info,
+        partition_local_objects,
+    )
+}
+
+fn render_postgres_table_ddl_with_constraints_and_partition_info(
+    schema: &str,
+    table: &str,
+    columns: &[db::ColumnInfo],
+    indexes: &[db::IndexInfo],
+    fkeys: &[db::ForeignKeyInfo],
+    constraints: &[db::ConstraintInfo],
+    check_constraints: &[(String, String)],
+    table_comment: Option<&str>,
+    partition_info: &db::postgres::PostgresTablePartitionInfo,
+    partition_local_objects: &db::postgres::PostgresTablePartitionLocalObjects,
+) -> String {
     let table_name = format!("{}.{}", pg_ident(schema), pg_ident(table));
     let partition_parent = partition_info
         .is_partition
@@ -10537,14 +12603,38 @@ fn render_postgres_table_ddl_with_partition_info(
             .collect::<Vec<_>>()
     };
 
-    let pks: Vec<&str> = if !is_partition || partition_local_objects.has_primary_key {
-        columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect()
-    } else {
-        Vec::new()
-    };
-    if !pks.is_empty() {
-        definition_lines
-            .push(format!("  PRIMARY KEY ({})", pks.iter().map(|key| pg_ident(key)).collect::<Vec<_>>().join(", ")));
+    let primary_constraints = constraints
+        .iter()
+        .filter(|constraint| constraint.constraint_type == "PRIMARY KEY" && !constraint.definition.trim().is_empty())
+        .collect::<Vec<_>>();
+    let unique_constraints = constraints
+        .iter()
+        .filter(|constraint| constraint.constraint_type == "UNIQUE" && !constraint.definition.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !is_partition || partition_local_objects.has_primary_key {
+        if primary_constraints.is_empty() {
+            let pks: Vec<&str> = columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect();
+            if !pks.is_empty() {
+                definition_lines.push(format!(
+                    "  PRIMARY KEY ({})",
+                    pks.iter().map(|key| pg_ident(key)).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        } else {
+            for constraint in &primary_constraints {
+                definition_lines.push(format!(
+                    "  CONSTRAINT {} {}",
+                    pg_ident(&constraint.name),
+                    constraint.definition.trim()
+                ));
+            }
+        }
+    }
+    for constraint in unique_constraints {
+        if is_partition && !partition_local_objects.unique_constraints.contains(&constraint.name) {
+            continue;
+        }
+        definition_lines.push(format!("  CONSTRAINT {} {}", pg_ident(&constraint.name), constraint.definition.trim()));
     }
     for fk_group in group_foreign_keys_by_name(fkeys) {
         let Some(first_fk) = fk_group.first() else {
@@ -10664,14 +12754,35 @@ fn render_postgres_table_ddl_with_partition_info(
     }
 
     for idx in indexes {
-        if idx.is_primary {
+        if idx.is_primary || idx.constraint_backed {
             continue;
         }
         if is_partition && !partition_local_objects.indexes.contains(&idx.name) {
             continue;
         }
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
-        let cols = idx.columns.iter().map(|c| pg_ident(c)).collect::<Vec<_>>().join(", ");
+        let cols = idx
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                // A real column is quoted via `pg_ident`; an expression/functional key part
+                // arrives as raw expression text (the per-column `pg_get_indexdef` omits the
+                // opclass — see `crates/dbx-core/src/db/postgres.rs`), so quoting the whole
+                // thing as an identifier would turn it into a nonexistent column reference
+                // (#6295).
+                let is_expr = idx.key_is_expression.get(i).copied().unwrap_or(false);
+                let mut col = if is_expr { c.clone() } else { pg_ident(c) };
+                // The opclass is read separately from `pg_index.indclass` for every key
+                // position (including expression keys) and appended uniformly — it never
+                // lives inside the expression text, so there is no duplication risk.
+                if let Some(opclass) = idx.column_opclasses.get(i).and_then(|o| o.as_deref()) {
+                    col.push_str(&format!(" {opclass}"));
+                }
+                col
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let using = idx.index_type.as_deref().map(|t| format!(" USING {t}")).unwrap_or_default();
         let include = idx
             .included_columns

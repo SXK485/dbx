@@ -10,10 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use super::with_connection_timeout;
 use crate::document_ops::{MongoGridFsBucketInfo, MongoGridFsFileInfo};
+use crate::models::connection::DatabaseConnectionInfo;
 use crate::types::IndexInfo;
 use futures::{io::AsyncReadExt, io::AsyncWriteExt, TryStreamExt};
 use percent_encoding::percent_decode_str;
 use std::{collections::HashSet, time::Duration};
+
+use crate::mongo_oidc::MongoOidcBrowserOpener;
 
 pub use super::document_result::DocumentQueryResult;
 /// Backward-compatible name for callers of Mongo-specific APIs.
@@ -66,12 +69,36 @@ pub struct MongoCloneCollectionResult {
 }
 
 pub async fn connect(url: &str, timeout: Duration, idle_timeout: Duration) -> Result<Client, String> {
+    connect_with_oidc(url, timeout, idle_timeout, None).await
+}
+
+pub async fn connect_with_oidc(
+    url: &str,
+    timeout: Duration,
+    idle_timeout: Duration,
+    oidc_browser_opener: Option<MongoOidcBrowserOpener>,
+) -> Result<Client, String> {
     let url = normalize_mongo_uri_direct_connection(url);
     let is_multi_host = is_multi_host_mongo_uri(&url);
     let parse_timeout = if is_multi_host { std::cmp::max(timeout * 2, Duration::from_secs(10)) } else { timeout };
 
     with_connection_timeout("MongoDB", parse_timeout, async {
         let mut options = ClientOptions::parse(&url).await.map_err(|e| format!("MongoDB connection failed: {e}"))?;
+        if let Some(credential) = options.credential.as_mut().filter(|credential| {
+            credential
+                .mechanism
+                .as_ref()
+                .is_some_and(|mechanism| matches!(mechanism, mongodb::options::AuthMechanism::MongoDbOidc))
+        }) {
+            // ENVIRONMENT selects the driver's built-in machine flow. Only
+            // install DBX's browser callback for interactive human OIDC.
+            if !mongo_oidc_uses_machine_environment(credential.mechanism_properties.as_ref()) {
+                let opener = oidc_browser_opener.ok_or_else(|| {
+                    "MongoDB OIDC browser authentication is only available in the DBX desktop app".to_string()
+                })?;
+                credential.oidc_callback = crate::mongo_oidc::human_callback(opener);
+            }
+        }
         options.connect_timeout = Some(timeout);
         options.server_selection_timeout =
             if is_multi_host { Some(std::cmp::max(timeout * 2, Duration::from_secs(10))) } else { Some(timeout) };
@@ -85,7 +112,7 @@ pub async fn connect(url: &str, timeout: Duration, idle_timeout: Duration) -> Re
         // set discovery. This is essential when connecting through a TCP proxy
         // or NAT where the driver would otherwise receive internal IPs from
         // the replica set handshake and fail to connect.
-        if !is_multi_host {
+        if !is_multi_host && options.load_balanced != Some(true) && options.direct_connection.is_none() {
             options.direct_connection = Some(true);
         }
         Client::with_options(options).map_err(|e| format!("MongoDB connection failed: {e}"))
@@ -152,6 +179,28 @@ fn mongo_url_param_is_direct_connection_true(part: &str) -> bool {
 }
 
 pub async fn test_connection(client: &Client, timeout: Duration, database: Option<&str>) -> Result<(), String> {
+    test_connection_with_timeout(client, timeout, database).await
+}
+
+pub async fn test_connection_for_url(
+    client: &Client,
+    url: &str,
+    timeout: Duration,
+    database: Option<&str>,
+) -> Result<(), String> {
+    let timeout = if mongo_uri_uses_oidc(url) {
+        timeout.saturating_add(crate::mongo_oidc::OIDC_BROWSER_AUTH_TIMEOUT)
+    } else {
+        timeout
+    };
+    test_connection_with_timeout(client, timeout, database).await
+}
+
+async fn test_connection_with_timeout(
+    client: &Client,
+    timeout: Duration,
+    database: Option<&str>,
+) -> Result<(), String> {
     let database = database.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("admin");
     let client = client.clone();
     let database = database.to_string();
@@ -166,11 +215,43 @@ pub async fn test_connection(client: &Client, timeout: Duration, database: Optio
     .await
 }
 
+pub fn mongo_uri_uses_oidc(uri: &str) -> bool {
+    uri.split_once('?')
+        .map(|(_, query)| {
+            query.split('#').next().unwrap_or("").split('&').any(|part| {
+                let Some((key, value)) = part.split_once('=') else {
+                    return false;
+                };
+                percent_decode_str(key).decode_utf8_lossy().eq_ignore_ascii_case("authMechanism")
+                    && percent_decode_str(value).decode_utf8_lossy().eq_ignore_ascii_case("MONGODB-OIDC")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn mongo_oidc_uses_machine_environment(properties: Option<&mongodb::bson::Document>) -> bool {
+    properties.is_some_and(|properties| properties.contains_key("ENVIRONMENT"))
+}
+
 pub async fn server_version(client: &Client, database: &str) -> Result<String, String> {
     let database = database.trim();
     let database = if database.is_empty() { "admin" } else { database };
     let result = client.database(database).run_command(doc! { "buildInfo": 1 }).await.map_err(|e| e.to_string())?;
     server_version_from_build_info(&result)
+}
+
+pub async fn database_connection_info(
+    client: &Client,
+    database: Option<&str>,
+) -> Result<DatabaseConnectionInfo, String> {
+    let version = server_version(client, database.unwrap_or("admin")).await?;
+    Ok(DatabaseConnectionInfo {
+        product_name: Some("MongoDB".to_string()),
+        product_version: Some(version),
+        current_database: database.map(str::to_string),
+        driver_name: Some("MongoDB Rust driver".to_string()),
+        ..Default::default()
+    })
 }
 
 pub async fn run_command(client: &Client, database: &str, command_json: &str) -> Result<MongoDocumentResult, String> {
@@ -823,6 +904,9 @@ fn index_info_from_model(model: IndexModel) -> IndexInfo {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        column_opclasses: vec![],
+        key_options: Vec::new(),
+        constraint_backed: false,
     }
 }
 
@@ -1156,7 +1240,7 @@ async fn find_documents_with_total(
         }
         Some(count.await.map_err(|e| e.to_string()))
     } else {
-        Some(col.estimated_document_count().await.map_err(|e| e.to_string()))
+        Some(estimated_document_count(client, database, collection).await)
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -1277,10 +1361,47 @@ pub async fn count_documents(
 
     if !accurate && filter_doc.is_empty() {
         // Legacy count() permits the metadata-backed fast path; countDocuments() must scan accurately.
-        col.estimated_document_count().await.map_err(|e| e.to_string())
+        estimated_document_count(client, database, collection).await
     } else {
         col.count_documents(filter_doc).await.map_err(|e| e.to_string())
     }
+}
+
+async fn estimated_document_count(client: &Client, database: &str, collection: &str) -> Result<u64, String> {
+    let result = client.database(database).run_command(doc! { "count": collection }).await;
+    match result {
+        Ok(result) => parse_count_command_result(&result),
+        Err(error) => parse_count_command_error(&error.kind).ok_or_else(|| error.to_string()),
+    }
+}
+
+/// Resolves a failed `count` command the way the driver's `estimated_document_count` does:
+/// NamespaceNotFound (code 26) means the collection is missing, i.e. an empty count, while any
+/// other error must propagate. Mirrors mongodb's internal `Error::is_ns_not_found`.
+fn parse_count_command_error(kind: &mongodb::error::ErrorKind) -> Option<u64> {
+    match kind {
+        mongodb::error::ErrorKind::Command(error) if error.code == 26 => Some(0),
+        _ => None,
+    }
+}
+
+fn parse_count_command_result(result: &Document) -> Result<u64, String> {
+    let value = result.get("n").ok_or_else(|| "MongoDB count command response is missing the 'n' field".to_string())?;
+
+    match value {
+        Bson::Int32(value) => u64::try_from(*value),
+        Bson::Int64(value) => u64::try_from(*value),
+        Bson::Double(value)
+            if value.is_finite()
+                && *value >= 0.0
+                && value.fract() == 0.0
+                && *value <= super::JS_MAX_SAFE_INTEGER as f64 =>
+        {
+            Ok(*value as u64)
+        }
+        _ => return Err(format!("MongoDB count command returned an invalid 'n' value: {value:?}")),
+    }
+    .map_err(|_| format!("MongoDB count command returned a negative 'n' value: {value:?}"))
 }
 
 /// Find MongoDB documents in a browser-friendly representation.
@@ -1315,7 +1436,7 @@ pub async fn find_documents_extended_json(
         }
         count.await.map_err(|e| e.to_string())
     } else {
-        col.estimated_document_count().await.map_err(|e| e.to_string())
+        estimated_document_count(client, database, collection).await
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -2383,11 +2504,137 @@ fn json_update_to_modifications(value: &serde_json::Value) -> Result<UpdateModif
     }
 }
 
-fn json_object_to_document_extended_json(value: &serde_json::Value) -> Result<Document, String> {
+pub fn json_object_to_document_extended_json(value: &serde_json::Value) -> Result<Document, String> {
     match Bson::try_from(value.clone()).map_err(|e| e.to_string())? {
         Bson::Document(doc) => Ok(doc),
         other => Err(format!("Expected a JSON object, got {other:?}")),
     }
+}
+
+pub fn document_to_canonical_extended_json(document: &Document) -> serde_json::Value {
+    Bson::Document(document.clone()).into_canonical_extjson()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MongoBulkWriteError {
+    pub message: String,
+    pub index: Option<usize>,
+    pub code: Option<i32>,
+    pub retryable: bool,
+}
+
+/// What actually happened to a submitted batch. A batch can partly succeed, so the count of
+/// inserted documents and the per-document rejections are reported together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MongoInsertOutcome {
+    pub inserted: u64,
+    /// One entry per document the server rejected, `index` pointing into the submitted batch.
+    pub errors: Vec<MongoBulkWriteError>,
+}
+
+pub async fn insert_bson_documents(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    documents: Vec<Document>,
+) -> Result<MongoInsertOutcome, MongoBulkWriteError> {
+    if documents.is_empty() {
+        return Ok(MongoInsertOutcome::default());
+    }
+    let total = documents.len() as u64;
+    let col = client.database(database).collection::<Document>(collection);
+    // Unordered: one rejected document must not abandon the rest of the batch, and the server
+    // then reports every rejection instead of stopping at the first.
+    match col.insert_many(documents).ordered(false).await {
+        Ok(result) => Ok(MongoInsertOutcome { inserted: result.inserted_ids.len() as u64, errors: Vec::new() }),
+        Err(error) => {
+            let errors = insert_write_errors(&error);
+            if errors.is_empty() {
+                // No per-document detail means the whole batch failed (network, auth, …).
+                return Err(map_insert_many_error(error));
+            }
+            Ok(MongoInsertOutcome { inserted: total.saturating_sub(errors.len() as u64), errors })
+        }
+    }
+}
+
+/// Per-document rejections, sorted by batch index. Empty when the failure was not per-document.
+fn insert_write_errors(error: &mongodb::error::Error) -> Vec<MongoBulkWriteError> {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    let mut errors = match error.kind.as_ref() {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            vec![write_error_entry(None, write_error.code, &write_error.message)]
+        }
+        ErrorKind::InsertMany(failure) => failure
+            .write_errors
+            .iter()
+            .flatten()
+            .map(|error| write_error_entry(Some(error.index), error.code, &error.message))
+            .collect(),
+        ErrorKind::BulkWrite(failure) => failure
+            .write_errors
+            .iter()
+            .map(|(index, error)| write_error_entry(Some(*index), error.code, &error.message))
+            .collect(),
+        _ => Vec::new(),
+    };
+    errors.sort_by_key(|error| error.index.unwrap_or(0));
+    errors
+}
+
+fn write_error_entry(index: Option<usize>, code: i32, message: &str) -> MongoBulkWriteError {
+    MongoBulkWriteError {
+        message: message.to_string(),
+        index,
+        code: Some(code),
+        retryable: is_retryable_mongo_write_code(code),
+    }
+}
+
+fn map_insert_many_error(error: mongodb::error::Error) -> MongoBulkWriteError {
+    use mongodb::error::ErrorKind;
+    match error.kind.as_ref() {
+        ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. } | ErrorKind::ServerSelection { .. } => {
+            MongoBulkWriteError { message: error.to_string(), index: None, code: None, retryable: true }
+        }
+        _ => MongoBulkWriteError { message: error.to_string(), index: None, code: None, retryable: false },
+    }
+}
+
+fn is_retryable_mongo_write_code(code: i32) -> bool {
+    !matches!(code, 11000 | 11001 | 12582)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn for_each_find_document(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    filter: Option<&str>,
+    projection: Option<&str>,
+    sort: Option<&str>,
+    collation: Option<&str>,
+    batch_size: u32,
+    mut on_document: impl FnMut(Document) -> Result<(), String>,
+) -> Result<(), String> {
+    let col = client.database(database).collection::<Document>(collection);
+    let filter_doc = parse_optional_filter_document(filter)?.unwrap_or_default();
+    let mut find = col.find(filter_doc).batch_size(batch_size);
+    if let Some(projection) = parse_optional_json_document(projection, "projection")? {
+        find = find.projection(projection);
+    }
+    if let Some(sort) = parse_optional_json_document(sort, "sort")? {
+        find = find.sort(sort);
+    }
+    if let Some(collation) = parse_find_collation(collation)? {
+        find = find.collation(collation);
+    }
+    let mut cursor = find.await.map_err(|error| error.to_string())?;
+    while cursor.advance().await.map_err(|error| error.to_string())? {
+        let document = cursor.deserialize_current().map_err(|error| error.to_string())?;
+        on_document(document)?;
+    }
+    Ok(())
 }
 
 fn json_object_to_document_preserving_existing(
@@ -2574,6 +2821,28 @@ fn json_filter_value_to_bson(value: &serde_json::Value, field_name: Option<&str>
         }
         serde_json::Value::Object(obj) => {
             if obj.len() == 1 {
+                // Shell constructor wrappers (UUID/BinData/Timestamp/MinKey/MaxKey),
+                // $regularExpression, and the numeric type wrappers decode through
+                // the shared extended JSON parser, following the same precedent as
+                // $date below, so typed number literals compare correctly in filters.
+                if obj.keys().next().is_some_and(|key| {
+                    matches!(
+                        key.as_str(),
+                        "$regularExpression"
+                            | "$uuid"
+                            | "$binary"
+                            | "$timestamp"
+                            | "$minKey"
+                            | "$maxKey"
+                            | "$numberInt"
+                            | "$numberDouble"
+                            | "$numberDecimal"
+                    )
+                }) {
+                    if let Ok(Some(value)) = parse_extended_json_value(obj) {
+                        return value;
+                    }
+                }
                 if let Some(serde_json::Value::String(hex)) = obj.get("$oid") {
                     if let Ok(oid) = ObjectId::parse_str(hex) {
                         return Bson::ObjectId(oid);
@@ -2664,6 +2933,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detects_oidc_auth_mechanism_in_mongo_uri() {
+        assert!(mongo_uri_uses_oidc("mongodb://localhost/test?authSource=%24external&authMechanism=MONGODB-OIDC"));
+        assert!(mongo_uri_uses_oidc(
+            "mongodb://localhost/test?authMechanism%3Dignored=x&authMechanism=mongodb-oidc#fragment"
+        ));
+        assert!(!mongo_uri_uses_oidc("mongodb://localhost/test?authSource=admin&authMechanism=SCRAM-SHA-256"));
+    }
+
+    #[test]
+    fn preserves_mongodb_driver_machine_oidc_environment() {
+        assert!(mongo_oidc_uses_machine_environment(Some(&mongodb::bson::doc! { "ENVIRONMENT": "k8s" })));
+        assert!(!mongo_oidc_uses_machine_environment(Some(&mongodb::bson::doc! { "TOKEN_RESOURCE": "resource" })));
+        assert!(!mongo_oidc_uses_machine_environment(None));
+    }
+
+    #[test]
     fn parses_find_collation_options() {
         let collation = parse_find_collation(Some(
             r#"{"locale":"en","strength":1,"caseLevel":true,"caseFirst":"upper","numericOrdering":true,"alternate":"shifted","maxVariable":"space","normalization":true,"backwards":false}"#,
@@ -2736,6 +3021,61 @@ mod tests {
     fn mongo_find_count_success_preserves_count_semantics() {
         assert_eq!(resolve_mongo_find_total(Ok(250), true, 100, 25), (250, true));
         assert_eq!(resolve_mongo_find_total(Ok(250), false, 100, 25), (250, false));
+    }
+
+    #[test]
+    fn parses_sharded_mongo_count_returned_as_integral_double() {
+        let response = doc! {
+            "shards": { "shard01": 887_286_174.0, "shard02": 885_925_656.0 },
+            "n": 1_773_211_830.0,
+            "ok": 1.0,
+        };
+
+        assert_eq!(parse_count_command_result(&response), Ok(1_773_211_830));
+    }
+
+    #[test]
+    fn parses_integer_mongo_count_results() {
+        assert_eq!(parse_count_command_result(&doc! { "n": 42_i32 }), Ok(42));
+        assert_eq!(parse_count_command_result(&doc! { "n": 4_294_967_296_i64 }), Ok(4_294_967_296));
+    }
+
+    #[test]
+    fn rejects_invalid_mongo_count_results() {
+        for response in [
+            doc! {},
+            doc! { "n": -1_i32 },
+            doc! { "n": 1.5 },
+            doc! { "n": f64::NAN },
+            doc! { "n": (super::super::JS_MAX_SAFE_INTEGER as f64) + 1.0 },
+            doc! { "n": "10" },
+        ] {
+            assert!(parse_count_command_result(&response).is_err(), "response should be rejected: {response:?}");
+        }
+    }
+
+    /// `CommandError` is `#[non_exhaustive]` with a private field, so tests build it through the
+    /// driver's derived `Deserialize`.
+    fn count_command_error(code: i32, code_name: &str) -> mongodb::error::CommandError {
+        serde_json::from_str(&format!(r#"{{"code": {code}, "codeName": "{code_name}", "errmsg": "count failed"}}"#))
+            .unwrap()
+    }
+
+    #[test]
+    fn maps_mongo_namespace_not_found_count_errors_to_zero() {
+        let kind = mongodb::error::ErrorKind::Command(count_command_error(26, "NamespaceNotFound"));
+
+        assert_eq!(parse_count_command_error(&kind), Some(0));
+    }
+
+    #[test]
+    fn propagates_mongo_count_errors_other_than_namespace_not_found() {
+        for (code, code_name) in [(13, "Unauthorized"), (17405, "CommandNotFound")] {
+            let kind = mongodb::error::ErrorKind::Command(count_command_error(code, code_name));
+
+            assert_eq!(parse_count_command_error(&kind), None, "code {code} should propagate");
+        }
+        assert_eq!(parse_count_command_error(&mongodb::error::ErrorKind::Shutdown), None);
     }
 
     #[test]
@@ -3138,6 +3478,130 @@ mod tests {
     }
 
     #[test]
+    fn json_filter_to_document_decodes_uuid_binary_timestamp_and_key_constants() {
+        // Equality on shell constructor values must compare against the typed
+        // BSON value, not a raw { "$uuid": ... } document the server rejects
+        // with "unknown operator: $uuid" (or silently matches nothing).
+        let filter = serde_json::json!({
+            "_id": { "$uuid": "3b241101-e2bb-4255-8caf-4136c566a962" },
+            "payload": { "$binary": { "base64": "AQID", "subType": "80" } },
+            "moment": { "$timestamp": { "t": 1735689600, "i": 7 } },
+            "lower": { "$minKey": 1 },
+            "upper": { "$maxKey": 1 },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        let expected_uuid = uuid::Uuid::parse_str("3b241101-e2bb-4255-8caf-4136c566a962").unwrap();
+        assert!(matches!(
+            doc.get("_id"),
+            Some(Bson::Binary(binary))
+                if binary.subtype == mongodb::bson::spec::BinarySubtype::Uuid && binary.bytes == expected_uuid.as_bytes()
+        ));
+        assert!(matches!(
+            doc.get("payload"),
+            Some(Bson::Binary(binary))
+                if binary.subtype == mongodb::bson::spec::BinarySubtype::UserDefined(0x80) && binary.bytes == [1, 2, 3]
+        ));
+        assert!(matches!(
+            doc.get("moment"),
+            Some(Bson::Timestamp(timestamp)) if timestamp.time == 1735689600 && timestamp.increment == 7
+        ));
+        assert!(matches!(doc.get("lower"), Some(Bson::MinKey)));
+        assert!(matches!(doc.get("upper"), Some(Bson::MaxKey)));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_key_constants_inside_operators() {
+        // Range operands must be decoded too, exactly like extended JSON dates:
+        // { score: { $gt: MinKey } } and { _id: { $gt: UUID(...) } } would
+        // otherwise compare against a sub-document and silently match nothing.
+        // The _id case also covers the all-$ operator document branch, where
+        // operators like $gt keep recursing through json_filter_value_to_bson.
+        let filter = serde_json::json!({
+            "score": { "$gt": { "$minKey": 1 }, "$lt": { "$maxKey": 1 } },
+            "_id": { "$gt": { "$uuid": "3b241101-e2bb-4255-8caf-4136c566a962" } },
+            "snapshot": { "$gte": { "$timestamp": { "t": 1735689600, "i": 7 } } },
+            "blob": { "$eq": { "$binary": { "base64": "AQID", "subType": "00" } } },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        let Some(Bson::Document(score)) = doc.get("score") else {
+            panic!("expected score operator document");
+        };
+        assert_eq!(score.get("$gt"), Some(&Bson::MinKey));
+        assert_eq!(score.get("$lt"), Some(&Bson::MaxKey));
+
+        let Some(Bson::Document(id_filter)) = doc.get("_id") else {
+            panic!("expected _id operator document");
+        };
+        assert!(matches!(
+            id_filter.get("$gt"),
+            Some(Bson::Binary(binary)) if binary.subtype == mongodb::bson::spec::BinarySubtype::Uuid
+        ));
+
+        let Some(Bson::Document(snapshot)) = doc.get("snapshot") else {
+            panic!("expected snapshot operator document");
+        };
+        assert!(matches!(
+            snapshot.get("$gte"),
+            Some(Bson::Timestamp(timestamp)) if timestamp.time == 1735689600 && timestamp.increment == 7
+        ));
+
+        let Some(Bson::Document(blob)) = doc.get("blob") else {
+            panic!("expected blob operator document");
+        };
+        assert!(matches!(
+            blob.get("$eq"),
+            Some(Bson::Binary(binary)) if binary.subtype == mongodb::bson::spec::BinarySubtype::Generic && binary.bytes == [1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_extended_json_number_wrappers() {
+        // Typed number literals must compare against the typed BSON value, not a
+        // raw { "$numberInt": ... } document the server rejects with
+        // "unknown operator" (or that silently matches nothing).
+        let filter = serde_json::json!({
+            "score": { "$numberInt": "5" },
+            "ratio": { "$numberDouble": "1.5" },
+            "price": { "$numberDecimal": "3.14" },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        assert_eq!(doc.get("score"), Some(&Bson::Int32(5)));
+        assert_eq!(doc.get("ratio"), Some(&Bson::Double(1.5)));
+        let expected_decimal: mongodb::bson::Decimal128 = "3.14".parse().unwrap();
+        assert_eq!(doc.get("price"), Some(&Bson::Decimal128(expected_decimal)));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_number_wrappers_inside_operators() {
+        // Range and $in operands must decode too, exactly like extended JSON
+        // dates: { score: { $gte: {"$numberInt": "5"} } } would otherwise
+        // compare against a sub-document and silently match nothing.
+        let filter = serde_json::json!({
+            "score": { "$gte": { "$numberInt": "5" } },
+            "tags": { "$in": [{ "$numberDecimal": "3.14" }, { "$numberDouble": "1.5" }] },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        let Some(Bson::Document(score)) = doc.get("score") else {
+            panic!("expected score operator document");
+        };
+        assert_eq!(score.get("$gte"), Some(&Bson::Int32(5)));
+
+        let Some(Bson::Document(tags)) = doc.get("tags") else {
+            panic!("expected tags operator document");
+        };
+        let Some(Bson::Array(values)) = tags.get("$in") else {
+            panic!("expected tags $in array");
+        };
+        let expected_decimal: mongodb::bson::Decimal128 = "3.14".parse().unwrap();
+        assert_eq!(values.first(), Some(&Bson::Decimal128(expected_decimal)));
+        assert_eq!(values.get(1), Some(&Bson::Double(1.5)));
+    }
+
+    #[test]
     fn bson_to_json_displays_date_as_mongo_isodate() {
         let date = DateTime::parse_rfc3339_str("2026-06-10T13:59:31.287Z").unwrap();
         let value = bson_to_json(&Bson::DateTime(date));
@@ -3535,6 +3999,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         });
 
         assert_eq!(spec.name, "email_1");
@@ -3560,6 +4027,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         });
 
         assert_eq!(
@@ -3803,6 +4273,9 @@ mod tests {
                 included_columns: None,
                 comment: None,
                 key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                key_options: Vec::new(),
+                constraint_backed: false,
             },
             IndexInfo {
                 name: "users_email_unique".to_string(),
@@ -3814,6 +4287,9 @@ mod tests {
                 included_columns: None,
                 comment: None,
                 key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                key_options: Vec::new(),
+                constraint_backed: false,
             },
             IndexInfo {
                 name: "users_status_idx".to_string(),
@@ -3825,6 +4301,9 @@ mod tests {
                 included_columns: None,
                 comment: None,
                 key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                key_options: Vec::new(),
+                constraint_backed: false,
             },
         ];
         let after = vec![before[0].clone(), before[2].clone()];
@@ -3869,6 +4348,25 @@ mod tests {
         assert!(matches!(doc.get("_id"), Some(Bson::ObjectId(oid)) if oid.to_hex() == "507f1f77bcf86cd799439011"));
         assert!(matches!(doc.get("created_at"), Some(Bson::DateTime(_))));
         assert!(matches!(doc.get("count"), Some(Bson::Int64(42))));
+    }
+
+    #[test]
+    fn json_filter_to_document_parses_extended_json_regex() {
+        let value = serde_json::json!({
+            "packagingRatio": {
+                "$regularExpression": {
+                    "pattern": "^[^:：]*盒",
+                    "options": "im",
+                }
+            }
+        });
+        let doc = json_filter_to_document(&value).unwrap();
+
+        assert!(matches!(
+            doc.get("packagingRatio"),
+            Some(Bson::RegularExpression(regex))
+                if regex.pattern == "^[^:：]*盒" && regex.options == "im"
+        ));
     }
 
     #[test]

@@ -10,6 +10,10 @@ export function displayCellValue(value: CellValue): string {
   return String(value);
 }
 
+export function clipboardCellValue(value: CellValue): string {
+  return value === null ? "" : displayCellValue(value);
+}
+
 export function firstLineCellDisplayValue(value: string, flatteningMultiLine: boolean): string {
   const lineBreakPattern = /\r\n|\r|\n/g;
   if (flatteningMultiLine) {
@@ -39,4 +43,11 @@ export function firstLineCellDisplayValue(value: string, flatteningMultiLine: bo
 export function limitDataGridCellDisplay(value: string, maxLength = DATA_GRID_CELL_DISPLAY_MAX_LENGTH): string {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength)}...`;
+}
+
+/** Visual-only cell text; never use whitespace markers for editing or serialization. */
+export function gridCellDisplayValue(value: string, flatteningMultiLine: boolean, showWhitespace: boolean): string {
+  const text = firstLineCellDisplayValue(value, flatteningMultiLine);
+  // Hair spaces keep adjacent dots legible in both DOM and Canvas rendering.
+  return showWhitespace ? text.replace(/[ \t]/g, (character) => (character === " " ? "\u200a·\u200a" : "→")) : text;
 }

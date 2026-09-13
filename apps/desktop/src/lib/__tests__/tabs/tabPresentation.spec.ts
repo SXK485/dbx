@@ -1,7 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { connectionGroupDisplayName, executionSummaryItems, middleEllipsis, queryResultBaseSql, queryResultExecutionSql, resultGridCacheKey, resultGridInstanceKey, resultSourceRange, statementExecutionMarkers, tabDisplayTitle, tabTooltipLines, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import {
+  connectionGroupDisplayName,
+  executionSummaryItems,
+  middleEllipsis,
+  queryResultBaseSql,
+  queryResultExecutionSql,
+  resultGridCacheKey,
+  resultGridColumnWidthCacheKey,
+  resultGridInstanceKey,
+  resultSourceRange,
+  statementExecutionMarkers,
+  tabColorStyle,
+  tabDatabaseIconType,
+  tabDisplayTitle,
+  tabIconClass,
+  tabTooltipLines,
+  tabularResultItems,
+  dirtyTabTitleStyle,
+} from "@/lib/tabs/tabPresentation";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
@@ -9,6 +27,9 @@ const translations: Record<string, string> = {
   "tabs.tooltipConnection": "Connection:",
   "tabs.tooltipGroup": "Group:",
   "tabs.tooltipDatabase": "Database:",
+  "tabs.tooltipTable": "Table:",
+  "tabs.tooltipTableComment": "Table Comment:",
+  "tree.events": "Events",
   "connectionGroup.ungroupedLabel": "Ungrouped",
   "editor.noDatabase": "No database",
 };
@@ -136,16 +157,31 @@ describe("query result labels", () => {
 describe("query result grid identity", () => {
   it("separates rerun payloads while retaining run and result-set identity", () => {
     const first = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2, resultGridRevision: "execution-1" });
-    const rerun = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2, resultGridRevision: "execution-2" });
+    const rerun = queryTab({ activeResultRunId: "run-2", activeResultIndex: 2, resultGridRevision: "execution-2" });
 
     expect(resultGridInstanceKey(first)).toBe("tab-1-run-1-2-execution-1");
     expect(resultGridInstanceKey(rerun)).not.toBe(resultGridInstanceKey(first));
     expect(resultGridInstanceKey({ ...first, activeResultIndex: 1 })).toBe("tab-1-run-1-1-execution-1");
-    expect(resultGridCacheKey(rerun)).toBe(resultGridCacheKey(first));
+    expect(resultGridCacheKey(rerun)).not.toBe(resultGridCacheKey(first));
+    expect(resultGridColumnWidthCacheKey(rerun)).toBe(resultGridColumnWidthCacheKey(first));
+    expect(resultGridColumnWidthCacheKey({ ...first, activeResultIndex: 1 })).not.toBe(resultGridColumnWidthCacheKey(first));
   });
 });
 
 describe("tab group presentation", () => {
+  it("does not expose the internal objects mode in object browser tab titles", () => {
+    const store = useConnectionStore();
+    store.connections = [{ id: "conn-1", name: "PostgreSQL", db_type: "postgres", driver_profile: "postgres", database: "app" } as ConnectionConfig];
+
+    expect(tabDisplayTitle(queryTab({ mode: "objects", title: "app objects" }), translate)).toBe("db");
+    expect(tabDisplayTitle(queryTab({ mode: "objects", title: "public objects", objectBrowser: { schema: "public" } }), translate)).toBe("public@db");
+  });
+
+  it("uses the selected MySQL event name for event editor tabs", () => {
+    expect(tabDisplayTitle(queryTab({ mode: "objects", objectBrowser: { objectType: "tables", initialObjectFilter: "events", eventName: "cleanup_sessions" } }), translate)).toBe("cleanup_sessions@db");
+    expect(tabDisplayTitle(queryTab({ mode: "objects", objectBrowser: { objectType: "tables", initialObjectFilter: "events" } }), translate)).toBe("Events@db");
+  });
+
   it("uses the live database and branch context for Dolt version control tabs", () => {
     const store = useConnectionStore();
     store.connections = [{ id: "conn-1", name: "Production Dolt", db_type: "mysql", driver_profile: "dolt", database: "app" } as ConnectionConfig];
@@ -188,6 +224,22 @@ describe("tab group presentation", () => {
     };
 
     expect(connectionGroupDisplayName("conn-1", translate)).toBe("Ungrouped");
+  });
+
+  it("shows a bounded table comment only when it is non-empty", () => {
+    const lines = tabTooltipLines(
+      queryTab({
+        mode: "data",
+        tableComment: `  ${"表".repeat(55)}\narchive  `,
+        tableMeta: { schema: "public", tableName: "users", columns: [], primaryKeys: [] },
+      }),
+      translate,
+    );
+    const comment = lines.find((line) => line.label === "Table Comment:")?.value;
+
+    expect(Array.from(comment || "")).toHaveLength(50);
+    expect(comment?.endsWith("…")).toBe(true);
+    expect(tabTooltipLines(queryTab({ mode: "data", tableComment: "   ", tableMeta: { schema: "public", tableName: "users", columns: [], primaryKeys: [] } }), translate).some((line) => line.label === "Table Comment:")).toBe(false);
   });
 });
 
@@ -378,5 +430,68 @@ describe("statement execution markers", () => {
   it("invalidates every marker after the editor document changes", () => {
     const executedSql = "SELECT 1;\nSELECT 2;";
     expect(statementExecutionMarkers(`-- edited\n${executedSql}`, [{ columns: ["value"], rows: [[1]], affected_rows: 0, execution_time_ms: 1, statement_index: 0, sourceStatement: "SELECT 1" }], "mysql", "stale-editor-fingerprint", executedSql)).toEqual([]);
+  });
+});
+
+describe("shared tab presentation helpers", () => {
+  it("classifies tab icon colors without MQ special-casing", () => {
+    expect(tabIconClass(queryTab({ mode: "data" }))).toContain("text-green-500");
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [{ id: "dynamodb-1", name: "DynamoDB", db_type: "dynamodb", driver_profile: "dynamodb", color: "" } as ConnectionConfig];
+    expect(tabIconClass(queryTab({ connectionId: "dynamodb-1", mode: "data" }))).toContain("text-amber-500");
+    expect(tabIconClass(queryTab({ mode: "mq" }))).toBe("");
+    expect(tabIconClass(queryTab({ externalSqlFileMissing: true }))).toContain("text-amber-600");
+    expect(tabIconClass(queryTab({ mode: "users" }))).toBe("text-primary");
+    expect(tabIconClass(queryTab({ mode: "objects", objectBrowser: { objectType: "tables", initialObjectFilter: "events", eventName: "cleanup_sessions" } }))).toBe("text-orange-400");
+  });
+
+  it("uses logical Redis database labels instead of the connection title", () => {
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [{ id: "redis-1", name: "Redis", db_type: "redis", driver_profile: "redis", color: "" } as ConnectionConfig];
+    expect(tabDisplayTitle(queryTab({ connectionId: "redis-1", database: "0", mode: "redis", sql: "" }), translate)).toBe("db0");
+    expect(tabDisplayTitle(queryTab({ connectionId: "redis-1", database: "1", mode: "redis", sql: "" }), translate)).toBe("db1");
+  });
+
+  it("keeps source tab colors aligned with the sidebar object palette", () => {
+    const colors = [
+      ["PROCEDURE", "text-blue-500"],
+      ["FUNCTION", "text-amber-500"],
+      ["SEQUENCE", "text-emerald-500"],
+      ["SYNONYM", "text-sky-500"],
+      ["PACKAGE", "text-cyan-500"],
+      ["PACKAGE_BODY", "text-cyan-400"],
+      ["TYPE", "text-violet-500"],
+      ["TYPE_BODY", "text-violet-400"],
+    ] as const;
+    for (const [objectType, color] of colors) {
+      expect(tabIconClass(queryTab({ objectSource: { name: "object", objectType } }))).toContain(color);
+    }
+  });
+
+  it("builds active/inactive color styles for classic and non-classic layouts", () => {
+    const activeClassic = tabColorStyle(queryTab({}), true, true);
+    expect(activeClassic?.boxShadow).toContain("var(--foreground)");
+    const inactiveModern = tabColorStyle(queryTab({}), false, false);
+    expect(inactiveModern?.borderColor).toBeUndefined();
+  });
+
+  it("resolves MQ driver icons from the connection store", () => {
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [
+      {
+        id: "mq-1",
+        name: "MQ",
+        db_type: "mq",
+        driver_profile: "kafka",
+        color: "",
+      } as ConnectionConfig,
+    ];
+    expect(tabDatabaseIconType(queryTab({ connectionId: "mq-1", mode: "mq" }))).toBe("kafka");
+  });
+
+  it("returns a dirty-title style only when the tab is dirty", () => {
+    expect(dirtyTabTitleStyle(false)).toBeUndefined();
+    expect(dirtyTabTitleStyle(true)?.fontStyle).toBe("italic");
+    expect(dirtyTabTitleStyle(true)?.fontWeight).toBe(700);
   });
 });

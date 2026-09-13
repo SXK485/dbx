@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -129,27 +130,30 @@ type querySession struct {
 }
 
 type server struct {
-	db                         *sql.DB
-	openDatabase               kingbaseDBOpener
-	params                     connectParams
-	mode                       kingbaseMode
-	usePgDefaultExpression     bool
-	usePgViewDefinition        bool
-	usePgFunctionDefinition    bool
-	useLegacyRoutineDefinition bool
-	catalogIdentityUnsupported bool
-	catalogOIDUnsupported      bool
-	infoColumnTypeUnsupported  bool
-	infoUdtNameUnsupported     bool
-	indexOrdinalityUnsupported bool
-	triggerPrettyUnsupported   bool
-	triggerInternalUnsupported bool
-	currentSchema              string
-	schemaSet                  bool
-	sessions                   map[string]*querySession
-	nextSessionID              uint64
-	activeCancelMu             sync.Mutex
-	activeCancel               context.CancelFunc
+	db                              *sql.DB
+	openDatabase                    kingbaseDBOpener
+	params                          connectParams
+	mode                            kingbaseMode
+	usePgDefaultExpression          bool
+	usePgViewDefinition             bool
+	usePgFunctionDefinition         bool
+	useLegacyRoutineDefinition      bool
+	catalogIdentityUnsupported      bool
+	catalogOIDUnsupported           bool
+	infoColumnTypeUnsupported       bool
+	infoUdtNameUnsupported          bool
+	indexOrdinalityUnsupported      bool
+	triggerPrettyUnsupported        bool
+	triggerInternalUnsupported      bool
+	constraintDefinitionUnsupported bool
+	constraintValidatedUnsupported  bool
+	constraintStatusUnsupported     bool
+	currentSchema                   string
+	schemaSet                       bool
+	sessions                        map[string]*querySession
+	nextSessionID                   uint64
+	activeCancelMu                  sync.Mutex
+	activeCancel                    context.CancelFunc
 }
 
 type agentSession struct {
@@ -407,6 +411,9 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 	case "list_foreign_keys":
 		result, err := s.listForeignKeys(stringParam(params, "schema"), stringParam(params, "table"))
 		return result, false, err
+	case "list_constraints":
+		result, err := s.listConstraints(stringParam(params, "schema"), stringParam(params, "table"))
+		return result, false, err
 	case "list_triggers":
 		result, err := s.listTriggers(stringParam(params, "schema"), stringParam(params, "table"))
 		return result, false, err
@@ -477,6 +484,9 @@ func (s *server) connect(cp connectParams) error {
 	s.indexOrdinalityUnsupported = false
 	s.triggerPrettyUnsupported = false
 	s.triggerInternalUnsupported = false
+	s.constraintDefinitionUnsupported = false
+	s.constraintValidatedUnsupported = false
+	s.constraintStatusUnsupported = false
 	return nil
 }
 
@@ -492,9 +502,17 @@ func (s *server) testConnection(cp connectParams) error {
 type kingbaseDBOpener func(connectParams, string) (*sql.DB, error)
 
 func openAndPingDB(cp connectParams, timeout time.Duration, opener kingbaseDBOpener) (*sql.DB, error) {
+	if endpoints := clusterConnectEndpoints(cp); len(endpoints) > 1 {
+		return openAndPingClusterEndpoints(cp, timeout, endpoints, opener)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return pingDBWithSSLModes(ctx, cp, opener)
+}
 
+// pingDBWithSSLModes runs the historical sslmode attempt sequence
+// ("prefer" degrades to require then disable) for one set of fields.
+func pingDBWithSSLModes(ctx context.Context, cp connectParams, opener kingbaseDBOpener) (*sql.DB, error) {
 	sslMode := effectiveSSLMode(cp)
 	attempts := []string{sslMode}
 	if sslMode == "prefer" {
@@ -511,12 +529,130 @@ func openAndPingDB(cp connectParams, timeout time.Duration, opener kingbaseDBOpe
 		if db != nil {
 			_ = db.Close()
 		}
-		if index == 0 && len(attempts) == 2 && errors.Is(err, gokb.ErrSSLNotSupported) {
+		if index == 0 && len(attempts) == 2 && shouldRetryKingbaseWithoutSSL(err) {
 			continue
 		}
 		return nil, err
 	}
 	return nil, errors.New("kingbase connection failed")
+}
+
+type kingbaseEndpoint struct {
+	host string
+	port int
+}
+
+// clusterConnectEndpoints splits the host field into ordered endpoints for
+// cluster (multi-IP) configurations. DBX stores cluster hosts as
+// comma-separated entries, each optionally embedding its own `:port`
+// (mirroring the vastbase/openGauss driver semantics); semicolons are also
+// accepted because Kingbase deployments paste both separators. A native
+// connection_string builds its own DSN, so the host field is only split for
+// the field-based path, and a host without any separator yields a single
+// endpoint which keeps the legacy single-host flow untouched.
+func clusterConnectEndpoints(cp connectParams) []kingbaseEndpoint {
+	if value := strings.TrimSpace(cp.ConnectionString); value != "" && !isKingbaseJDBCURL(value) {
+		return nil
+	}
+	defaultPort := cp.Port
+	if defaultPort <= 0 {
+		defaultPort = 54321
+	}
+	return splitHostEndpoints(cp.Host, defaultPort)
+}
+
+// splitHostEndpoints parses `host1[:port1][,;]host2[:port2]...`. Entries
+// without an embedded port use fallbackPort; bracketed IPv6 literals may
+// carry a port after the closing bracket.
+func splitHostEndpoints(rawHost string, fallbackPort int) []kingbaseEndpoint {
+	parts := strings.FieldsFunc(rawHost, func(r rune) bool { return r == ',' || r == ';' })
+	endpoints := make([]kingbaseEndpoint, 0, len(parts))
+	for _, part := range parts {
+		host, port, ok := parseHostEndpoint(strings.TrimSpace(part), fallbackPort)
+		if !ok {
+			continue
+		}
+		endpoints = append(endpoints, kingbaseEndpoint{host: host, port: port})
+	}
+	return endpoints
+}
+
+func parseHostEndpoint(entry string, fallbackPort int) (string, int, bool) {
+	if entry == "" {
+		return "", 0, false
+	}
+	if strings.HasPrefix(entry, "[") {
+		if close := strings.Index(entry, "]"); close > 0 {
+			host := entry[1:close]
+			suffix := entry[close+1:]
+			portText, hasPort := strings.CutPrefix(suffix, ":")
+			if !hasPort && suffix == "" {
+				return host, fallbackPort, true
+			}
+			if hasPort {
+				if port, err := strconv.Atoi(portText); err == nil && validEndpointPort(port) {
+					return host, port, true
+				}
+			}
+			// Malformed bracketed entries such as `[::1]x` keep their raw
+			// text so the eventual dial error stays honest.
+			return entry, fallbackPort, true
+		}
+	}
+	if strings.Count(entry, ":") == 1 {
+		if host, rawPort, ok := strings.Cut(entry, ":"); ok && host != "" {
+			if port, err := strconv.Atoi(rawPort); err == nil && validEndpointPort(port) {
+				return host, port, true
+			}
+		}
+	}
+	// Bare IPv6 literals and hostnames (including entries with a non-numeric
+	// port suffix) are forwarded verbatim, exactly like the single-host path.
+	return entry, fallbackPort, true
+}
+
+func validEndpointPort(port int) bool {
+	return port > 0 && port <= 65535
+}
+
+// openAndPingClusterEndpoints tries each configured endpoint in order and
+// keeps the first connection that completes the sslmode sequence, matching
+// the failover behavior the openGauss-family drivers implement natively.
+// Following libpq semantics, every endpoint gets its own full timeout
+// budget so one unreachable node cannot starve the remaining candidates.
+func openAndPingClusterEndpoints(
+	cp connectParams,
+	timeout time.Duration,
+	endpoints []kingbaseEndpoint,
+	opener kingbaseDBOpener,
+) (*sql.DB, error) {
+	failures := make([]error, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		endpointParams := cp
+		endpointParams.Host = endpoint.host
+		endpointParams.Port = endpoint.port
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		db, err := pingDBWithSSLModes(ctx, endpointParams, opener)
+		cancel()
+		if err == nil {
+			return db, nil
+		}
+		failures = append(failures, fmt.Errorf("%s:%d: %w", endpoint.host, endpoint.port, err))
+	}
+	return nil, fmt.Errorf("kingbase connection failed after trying %d endpoints: %w", len(endpoints), errors.Join(failures...))
+}
+
+func shouldRetryKingbaseWithoutSSL(err error) bool {
+	if errors.Is(err, gokb.ErrSSLNotSupported) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+
+	// KingBase V7 can accept the SSLRequest and then reject the TLS handshake,
+	// so gokb returns the TLS alert instead of ErrSSLNotSupported.
+	return strings.Contains(strings.ToLower(err.Error()), "remote error: tls: handshake failure")
 }
 
 func openDBWithSSLMode(cp connectParams, sslMode string) (*sql.DB, error) {
@@ -548,6 +684,9 @@ func (s *server) disconnect() error {
 	s.indexOrdinalityUnsupported = false
 	s.triggerPrettyUnsupported = false
 	s.triggerInternalUnsupported = false
+	s.constraintDefinitionUnsupported = false
+	s.constraintValidatedUnsupported = false
+	s.constraintStatusUnsupported = false
 	s.currentSchema = ""
 	s.schemaSet = false
 	if s.db == nil {
@@ -757,7 +896,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		if !session.rows.Next() {
 			return result, session.rows.Err()
 		}
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -769,7 +908,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		return result, nil
 	}
 	if session.rows.Next() {
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -785,13 +924,14 @@ func readRows(rows *sql.Rows, maxRows int) (queryResult, error) {
 		return queryResult{}, err
 	}
 	columns = nonNilStrings(columns)
-	result := queryResult{Columns: columns, ColumnTypes: columnTypeNames(rows), Rows: make([][]any, 0, min(maxRows, 1024))}
+	columnTypes := columnTypeNames(rows)
+	result := queryResult{Columns: columns, ColumnTypes: columnTypes, Rows: make([][]any, 0, min(maxRows, 1024))}
 	for rows.Next() {
 		if len(result.Rows) >= maxRows {
 			result.Truncated = true
 			break
 		}
-		row, err := scanRow(rows, len(columns))
+		row, err := scanRow(rows, len(columns), columnTypes)
 		if err != nil {
 			return queryResult{}, err
 		}
@@ -800,7 +940,7 @@ func readRows(rows *sql.Rows, maxRows int) (queryResult, error) {
 	return result, rows.Err()
 }
 
-func scanRow(rows *sql.Rows, count int) ([]any, error) {
+func scanRow(rows *sql.Rows, count int, columnTypes []string) ([]any, error) {
 	storage := make([]any, count*2)
 	values := storage[:count]
 	dest := storage[count:]
@@ -811,9 +951,16 @@ func scanRow(rows *sql.Rows, count int) ([]any, error) {
 		return nil, err
 	}
 	for i, value := range values {
-		values[i] = normalizeValue(value)
+		values[i] = normalizeValue(value, columnTypeAt(columnTypes, i))
 	}
 	return values, nil
+}
+
+func columnTypeAt(columnTypes []string, index int) string {
+	if index < 0 || index >= len(columnTypes) {
+		return ""
+	}
+	return columnTypes[index]
 }
 
 func columnTypeNames(rows *sql.Rows) []string {
@@ -909,7 +1056,7 @@ func (s *server) setSchema(ctx context.Context, conn *sql.Conn, schema string) e
 	if schema != "" {
 		// Kingbase implicitly prioritizes its system catalog when it is not
 		// listed explicitly, matching the JDBC agent and DBeaver behavior.
-		statement = "SET search_path TO " + quoteIdentifier(schema)
+		statement = "SET search_path TO " + s.quoteIdentifier(schema)
 	}
 	if _, err := conn.ExecContext(ctx, statement); err != nil {
 		return err
@@ -1452,7 +1599,7 @@ func isUTF8Encoding(name string) bool {
 	return s == "utf8" || s == "unicode"
 }
 
-func normalizeValue(value any) any {
+func normalizeValue(value any, columnTypeName string) any {
 	switch typed := value.(type) {
 	case nil:
 		return nil
@@ -1462,6 +1609,13 @@ func normalizeValue(value any) any {
 		}
 		return map[string]string{"$binary": base64.StdEncoding.EncodeToString(typed)}
 	case time.Time:
+		// KingBase "timestamp"/"date" columns are wall-clock values with no timezone
+		// meaning; the gokb driver decodes them into a time.Time labeled with the
+		// process-local zone, which is not a real UTC instant. Formatting those with
+		// an offset (RFC3339Nano) makes clients double-apply the timezone shift.
+		if isKingbaseTimezoneLessDateTime(columnTypeName) {
+			return typed.Format("2006-01-02T15:04:05.999999999")
+		}
 		return typed.Format(time.RFC3339Nano)
 	case int8:
 		return int64(typed)
@@ -1473,6 +1627,16 @@ func normalizeValue(value any) any {
 		return float64(typed)
 	default:
 		return typed
+	}
+}
+
+func isKingbaseTimezoneLessDateTime(columnTypeName string) bool {
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(columnTypeName), " ", ""))
+	switch normalized {
+	case "DATE", "TIMESTAMP", "TIME":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1866,6 +2030,13 @@ func isSQLDollarTagByte(value byte) bool {
 
 func quoteIdentifier(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func (s *server) quoteIdentifier(value string) string {
+	if s.mode.mysqlCompat {
+		return "`" + strings.ReplaceAll(value, "`", "``") + "`"
+	}
+	return quoteIdentifier(value)
 }
 
 func quoteLiteral(value string) string {

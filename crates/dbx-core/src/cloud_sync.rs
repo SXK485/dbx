@@ -13,8 +13,9 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use crate::ai::AiConfigItem;
 use crate::connection_secrets::{
-    MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
-    MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
+    CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TRUSTSTORE_PASSWORD_KEY, MQ_AUTH_API_KEY_VALUE_KEY,
+    MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
+    NACOS_RNACOS_CONSOLE_PASSWORD_KEY, PLUGIN_CONNECTION_SECRET_PREFIX,
 };
 use crate::models::connection::{ConnectionConfig, DatabaseType, TransportLayerConfig};
 use crate::saved_sql::SavedSqlLibrary;
@@ -42,6 +43,8 @@ const SECRET_KEYS: &[&str] = &[
     MQ_TOKEN_SIGNING_KEY,
     NACOS_AUTH_PASSWORD_KEY,
     NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
+    CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
+    CASSANDRA_KEYSTORE_PASSWORD_KEY,
 ];
 const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
 const TRANSPORT_LAYER_SECRET_PREFIX: &str = "transport_layers.";
@@ -969,6 +972,8 @@ fn scrub_connection_secrets(config: &mut ConnectionConfig) {
     scrub_mqtt_auth_secrets(config);
     scrub_mq_external_config_secrets(config);
     scrub_nacos_auth_secrets(config);
+    scrub_cassandra_tls_secrets(config);
+    config.connection_secrets.clear();
 }
 
 fn scrub_mqtt_auth_secrets(config: &mut ConnectionConfig) {
@@ -1003,6 +1008,14 @@ async fn build_sensitive_payload(
         // A transient password must not become durable through a sync snapshot.
         if config.save_password {
             push_secret(&mut connection_secrets, &config.id, "password", &config.password);
+        }
+        for (key, secret) in &config.connection_secrets {
+            push_secret(
+                &mut connection_secrets,
+                &config.id,
+                &format!("{PLUGIN_CONNECTION_SECRET_PREFIX}{key}"),
+                secret,
+            );
         }
         push_secret(&mut connection_secrets, &config.id, "init_script", config.init_script.as_deref().unwrap_or(""));
         for (index, layer) in config.transport_layers.iter().enumerate() {
@@ -1044,7 +1057,10 @@ async fn build_sensitive_payload(
             push_secret(&mut connection_secrets, &config.id, "connection_string", connection_string);
         }
         push_mq_external_config_secrets(&mut connection_secrets, config);
-        push_nacos_external_config_secrets(&mut connection_secrets, config);
+        push_cassandra_tls_secrets(&mut connection_secrets, config);
+        if config.save_password {
+            push_nacos_external_config_secrets(&mut connection_secrets, config);
+        }
     }
 
     Ok(SensitiveSyncPayload {
@@ -1094,6 +1110,38 @@ fn scrub_mq_external_config_secrets(config: &mut ConnectionConfig) {
     if let Some(signing) = external_config.get_mut("tokenSigning").and_then(serde_json::Value::as_object_mut) {
         scrub_json_secret(signing, "key");
     }
+}
+
+fn push_cassandra_tls_secrets(secrets: &mut Vec<ConnectionSecretSnapshot>, config: &ConnectionConfig) {
+    if config.db_type != DatabaseType::Cassandra {
+        return;
+    }
+    let Some(tls) = config
+        .external_config
+        .as_ref()
+        .and_then(|external_config| external_config.get("tls"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    push_json_secret(secrets, &config.id, CASSANDRA_TRUSTSTORE_PASSWORD_KEY, tls, "truststore_password");
+    push_json_secret(secrets, &config.id, CASSANDRA_KEYSTORE_PASSWORD_KEY, tls, "keystore_password");
+}
+
+fn scrub_cassandra_tls_secrets(config: &mut ConnectionConfig) {
+    if config.db_type != DatabaseType::Cassandra {
+        return;
+    }
+    let Some(tls) = config
+        .external_config
+        .as_mut()
+        .and_then(|external_config| external_config.get_mut("tls"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    scrub_json_secret(tls, "truststore_password");
+    scrub_json_secret(tls, "keystore_password");
 }
 
 fn push_nacos_external_config_secrets(secrets: &mut Vec<ConnectionSecretSnapshot>, config: &ConnectionConfig) {
@@ -1186,12 +1234,13 @@ async fn apply_sensitive_payload(
         if !SECRET_KEYS.contains(&secret.key.as_str())
             && !secret.key.starts_with(SSH_TUNNEL_SECRET_PREFIX)
             && !secret.key.starts_with(TRANSPORT_LAYER_SECRET_PREFIX)
+            && !secret.key.starts_with(PLUGIN_CONNECTION_SECRET_PREFIX)
         {
             continue;
         }
         // Metadata is applied before secrets. Never let an older encrypted snapshot
         // restore a password after the user chose not to retain it locally.
-        if secret.key == "password"
+        if matches!(secret.key.as_str(), "password" | NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY)
             && connections.iter().any(|config| config.id == secret.connection_id && !config.save_password)
         {
             continue;
@@ -1225,6 +1274,7 @@ async fn clear_connection_secrets(storage: &Storage, connections: &[ConnectionCo
         for key in SECRET_KEYS {
             storage.delete_secret(&config.id, key).await?;
         }
+        storage.delete_secret_prefix(&config.id, PLUGIN_CONNECTION_SECRET_PREFIX).await?;
         for (index, layer) in config.transport_layers.iter().enumerate() {
             match layer {
                 TransportLayerConfig::Ssh(_) => {
@@ -1601,10 +1651,11 @@ fn parent_collection_paths(remote_path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_sensitive_payload, apply_sync_snapshot, build_sync_snapshot, build_sync_snapshot_with_saved_secrets,
-        decrypt_sensitive_payload, encrypt_sensitive_payload, encrypt_snippet_snapshot, finalize_snippet_migration,
-        forget_webdav_sync_secrets_passphrase, gitee_snippet_payload, is_legacy_dbx_snapshot, normalized_remote_path,
-        parent_collection_paths, parse_legacy_dbx_snapshot, parse_snippet_snapshot, prepare_legacy_snippet_snapshot,
+        apply_sensitive_payload, apply_sync_snapshot, build_sensitive_payload, build_sync_snapshot,
+        build_sync_snapshot_with_saved_secrets, decrypt_sensitive_payload, encrypt_sensitive_payload,
+        encrypt_snippet_snapshot, finalize_snippet_migration, forget_webdav_sync_secrets_passphrase,
+        gitee_snippet_payload, is_legacy_dbx_snapshot, normalized_remote_path, parent_collection_paths,
+        parse_legacy_dbx_snapshot, parse_snippet_snapshot, prepare_legacy_snippet_snapshot,
         resolve_webdav_sync_secrets_passphrase, retry_pending_snippet_cleanup, save_snippet_sync_id,
         save_webdav_sync_secrets_preference, scrub_connection_secrets, snapshot_for_snippet_upload,
         snippet_file_content, snippet_response_id, snippet_sync_settings, webdav_endpoint_uses_direct_connection,
@@ -1612,7 +1663,10 @@ mod tests {
         SnippetProvider, SnippetSyncClient, SnippetSyncConfig, WebDavClient, WebDavConfig, DEFAULT_SNIPPET_FILE_NAME,
     };
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiConfigItem};
-    use crate::connection_secrets::NACOS_AUTH_PASSWORD_KEY;
+    use crate::connection_secrets::{
+        CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TRUSTSTORE_PASSWORD_KEY, NACOS_AUTH_PASSWORD_KEY,
+        NACOS_RNACOS_CONSOLE_PASSWORD_KEY, PLUGIN_CONNECTION_SECRET_PREFIX,
+    };
     use crate::models::connection::{
         default_redis_key_separator, ConnectionConfig, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
@@ -1631,10 +1685,13 @@ mod tests {
                 model: "gpt-4o-mini".to_string(),
                 models: vec![],
                 api_style: AiApiStyle::Completions,
+                custom_headers: Default::default(),
                 proxy_enabled: false,
                 proxy_url: String::new(),
+                skip_tls_verify: false,
                 enable_thinking: true,
                 reasoning_level: crate::ai::AiReasoningLevel::Default,
+                max_output_tokens: None,
                 runtime_effort: None,
                 context_window: None,
                 max_retries: None,
@@ -1768,6 +1825,7 @@ mod tests {
             database: Some("app_db".to_string()),
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -1795,10 +1853,16 @@ mod tests {
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -1808,6 +1872,22 @@ mod tests {
             production_databases: vec![],
             database_info: None,
         }
+    }
+
+    fn cassandra_connection(id: &str) -> ConnectionConfig {
+        let mut config = postgres_connection(id, "");
+        config.name = "Cassandra".to_string();
+        config.db_type = DatabaseType::Cassandra;
+        config.port = 9042;
+        config.external_config = Some(serde_json::json!({
+            "tls": {
+                "truststore_path": "/certs/client.truststore",
+                "truststore_password": "trust-secret",
+                "keystore_path": "/certs/client.keystore",
+                "keystore_password": "key-secret"
+            }
+        }));
+        config
     }
 
     fn nacos_connection(id: &str, password: &str) -> ConnectionConfig {
@@ -1829,6 +1909,7 @@ mod tests {
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -1856,6 +1937,8 @@ mod tests {
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -1868,6 +1951,10 @@ mod tests {
                     "password": password
                 }
             })),
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -2060,6 +2147,7 @@ mod tests {
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -2115,10 +2203,16 @@ mod tests {
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -2147,6 +2241,30 @@ mod tests {
         let public_json = serde_json::to_string(&config).unwrap();
         assert!(!public_json.contains("token-value"));
         assert!(super::SECRET_KEYS.contains(&"init_script"));
+    }
+
+    #[tokio::test]
+    async fn cassandra_tls_store_passwords_move_to_sensitive_sync_payload() {
+        let config = cassandra_connection("cassandra");
+        let mut public_config = config.clone();
+        scrub_connection_secrets(&mut public_config);
+        let tls =
+            public_config.external_config.as_ref().and_then(|external_config| external_config.get("tls")).unwrap();
+        assert_eq!(tls["truststore_password"], "");
+        assert_eq!(tls["keystore_password"], "");
+
+        let storage = Storage::open(&temp_db_path("cassandra-sensitive-payload")).await.unwrap();
+        let payload = build_sensitive_payload(&storage, &[config], &[]).await.unwrap();
+        assert!(payload.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "cassandra"
+                && secret.key == CASSANDRA_TRUSTSTORE_PASSWORD_KEY
+                && secret.secret == "trust-secret"
+        }));
+        assert!(payload.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "cassandra"
+                && secret.key == CASSANDRA_KEYSTORE_PASSWORD_KEY
+                && secret.secret == "key-secret"
+        }));
     }
 
     #[test]
@@ -2558,6 +2676,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_connection_secrets_are_scrubbed_from_public_sync_metadata() {
+        let storage = Storage::open(&temp_db_path("plugin-public-sync")).await.unwrap();
+        let mut config = postgres_connection("plugin", "");
+        config.db_type = DatabaseType::Plugin;
+        config.plugin_id = Some("example.plugin".to_string());
+        config.plugin_connection_provider = Some("example.connection".to_string());
+        config.connection_secrets.insert("api_token".to_string(), "plugin-secret".to_string());
+        storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
+
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-pass")).await.unwrap();
+        let public_json = serde_json::to_string(&snapshot.connections).unwrap();
+        assert!(!public_json.contains("plugin-secret"));
+        let encrypted = snapshot.encrypted_secrets.as_ref().expect("encrypted secrets");
+        let decrypted = decrypt_sensitive_payload(encrypted, "sync-pass").unwrap();
+        assert!(decrypted.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "plugin"
+                && secret.key == format!("{PLUGIN_CONNECTION_SECRET_PREFIX}api_token")
+                && secret.secret == "plugin-secret"
+        }));
+    }
+
+    #[tokio::test]
     async fn sync_restore_does_not_revive_password_when_connection_disables_saving() {
         let source = Storage::open(&temp_db_path("sync-no-save-password-source")).await.unwrap();
         source.save_connections(&[postgres_connection("pg", "remote-secret")]).await.unwrap();
@@ -2610,6 +2750,39 @@ mod tests {
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "nacos" && secret.key == NACOS_AUTH_PASSWORD_KEY && secret.secret == "nacos-secret"
         }));
+    }
+
+    #[tokio::test]
+    async fn sync_never_snapshots_or_restores_nacos_passwords_when_saving_is_disabled() {
+        let source = Storage::open(&temp_db_path("sync-no-save-nacos-source")).await.unwrap();
+        let mut config = nacos_connection("nacos", "transient-secret");
+        config.save_password = false;
+        let payload = build_sensitive_payload(&source, std::slice::from_ref(&config), &[]).await.unwrap();
+        assert!(!payload.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "nacos"
+                && matches!(secret.key.as_str(), NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY)
+        }));
+
+        let legacy_payload = SensitiveSyncPayload {
+            connection_secrets: vec![
+                ConnectionSecretSnapshot {
+                    connection_id: "nacos".to_string(),
+                    key: NACOS_AUTH_PASSWORD_KEY.to_string(),
+                    secret: "legacy-primary-secret".to_string(),
+                },
+                ConnectionSecretSnapshot {
+                    connection_id: "nacos".to_string(),
+                    key: NACOS_RNACOS_CONSOLE_PASSWORD_KEY.to_string(),
+                    secret: "legacy-console-secret".to_string(),
+                },
+            ],
+            ai_configs: None,
+            ai_config: None,
+            tunnel_profiles: None,
+        };
+        apply_sensitive_payload(&source, &legacy_payload, &[config]).await.unwrap();
+        assert_eq!(source.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap(), None);
+        assert_eq!(source.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap(), None);
     }
 
     #[tokio::test]
