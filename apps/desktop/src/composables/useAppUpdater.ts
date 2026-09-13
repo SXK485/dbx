@@ -6,7 +6,6 @@ import * as api from "@/lib/backend/api";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { UpdateDownloadSource as SettingsUpdateDownloadSource } from "@/stores/settingsStore";
 import type { UpdateDownloadProgress } from "@/lib/backend/tauri";
-import { currentLocale } from "@/i18n";
 import { shouldBlockAppUpdate } from "@/lib/app/appUpdateTaskGuard";
 import { downloadAndInstallUpdateWhenIdle, installDownloadedUpdateWhenIdle } from "@/lib/app/appUpdateInstallFlow";
 
@@ -137,28 +136,14 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   }
 
   async function checkUpdates(options: { silent?: boolean } = {}) {
-    if (checkingUpdates.value) return;
-    checkingUpdates.value = true;
-    updateCheckMessage.value = "";
-    try {
-      const info = await api.checkForUpdates(currentLocale(), normalizeUpdateDownloadSource(settingsStore.editorSettings.updateDownloadSource));
-      updateInfo.value = info;
-      if (info.update_available) {
-        if (shouldOpenUpdateDialog({ silent: options.silent })) {
-          showUpdateDialog.value = true;
-        }
-      } else if (!options.silent) {
-        updateCheckMessage.value = t("updates.upToDate", { version: info.current_version });
-        showUpdateDialog.value = true;
-      }
-    } catch (e: any) {
-      if (!options.silent) {
-        updateCheckMessage.value = formatUpdateError(String(e));
-        showUpdateDialog.value = true;
-      }
-    } finally {
-      checkingUpdates.value = false;
+    // Personalized fork: the upstream auto-update would download the official
+    // signed build and overwrite this customized app, so update checks are
+    // disabled. The official endpoints are removed from tauri.conf.json too.
+    if (!options.silent) {
+      updateCheckMessage.value = t("updates.disabledInFork");
+      showUpdateDialog.value = true;
     }
+    return;
   }
 
   function formatUpdateError(message: string): string {

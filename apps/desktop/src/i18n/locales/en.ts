@@ -282,6 +282,7 @@ export default {
     availableTitle: "Update available",
     availableMessage: "DBX {latest} is available. You are using {current}.",
     upToDate: "DBX is up to date ({version}).",
+    disabledInFork: "This is a personalized build: upstream auto-update is disabled so it cannot overwrite your customizations. To update, pull upstream yourself and rebuild.",
     failed: "Failed to check updates: {error}",
     rateLimited: "GitHub update checks are temporarily rate limited. You can still open the release page to check manually.",
     openRelease: "Open Release",

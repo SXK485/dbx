@@ -207,6 +207,7 @@ export default withEnglishFallback({
     availableTitle: "发现新版本",
     availableMessage: "DBX {latest} 已发布，当前版本为 {current}。",
     upToDate: "DBX 已是最新版本 ({version})。",
+    disabledInFork: "当前是个性化构建，已关闭官方自动更新（避免覆盖自定义功能）。如需更新，请自行拉取上游代码并重新打包。",
     failed: "检查更新失败：{error}",
     rateLimited: "GitHub 更新检查暂时触发频率限制。你仍然可以打开下载页手动查看。",
     openRelease: "打开下载页",
