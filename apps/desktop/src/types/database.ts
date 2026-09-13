@@ -164,6 +164,13 @@ export interface ConnectionConfig {
    * lets the notes file live in a repository and be reviewed in pull requests.
    */
   docs_notes_path?: string;
+  /**
+   * Directory where this connection's database-scoped saved SQL queries live
+   * as real `.sql` files (Navicat-style `<dir>/<database>/<name>.sql`). The
+   * filesystem is the source of truth for queries in this directory. Falls
+   * back to the global saved SQL base directory when unset.
+   */
+  saved_sql_dir?: string;
   transport_layers?: TransportLayerConfig[];
   connect_timeout_secs?: number;
   connect_timeout_inherit?: boolean;
@@ -1363,12 +1370,26 @@ export interface SavedSqlFile {
   catalog?: string;
   schema?: string;
   sql: string;
+  /**
+   * Absolute path of the backing `.sql` file when the query lives in a
+   * Navicat-style on-disk directory. The file is the source of truth for
+   * file-backed queries.
+   */
+  filePath?: string | null;
   sqlLoaded?: boolean;
   orderIndex?: number;
   openCount?: number;
   openedAt?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** One `.sql` file found by a saved SQL directory scan. */
+export interface SavedSqlDirFile {
+  /** Forward-slash path relative to the queries directory, e.g. `robot/update.sql`. */
+  relativePath: string;
+  name: string;
+  sql: string;
 }
 
 export interface SavedSqlLibrary {

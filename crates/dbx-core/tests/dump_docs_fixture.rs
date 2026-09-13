@@ -22,6 +22,7 @@ fn live_postgres_config(
     database: &str,
 ) -> ConnectionConfig {
     ConnectionConfig {
+        saved_sql_dir: None,
         docs_notes_path: None,
         id: id.to_string(),
         name: id.to_string(),

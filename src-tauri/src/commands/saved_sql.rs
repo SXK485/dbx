@@ -6,7 +6,9 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use tauri::State;
+use tauri::{Emitter, Manager, State};
+
+use notify::Watcher;
 
 use dbx_core::connection::AppState;
 use dbx_core::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
@@ -102,6 +104,87 @@ pub async fn delete_saved_sql_file(state: State<'_, Arc<AppState>>, id: String) 
 #[tauri::command]
 pub async fn saved_sql_storage_dir(state: State<'_, SavedSqlStorageState>) -> Result<String, String> {
     Ok(state.data_dir.to_string_lossy().to_string())
+}
+
+/// Human-friendly folder name for a database type, matching the directory
+/// layout users expect from desktop database tools (`MySQL`, `PostgreSQL`, ...).
+fn queries_type_folder(db_type: &str) -> String {
+    match db_type.to_ascii_lowercase().as_str() {
+        "mysql" => "MySQL".to_string(),
+        "postgres" => "PostgreSQL".to_string(),
+        "sqlite" => "SQLite".to_string(),
+        "sqlserver" => "SQL Server".to_string(),
+        "oracle" => "Oracle".to_string(),
+        "mongodb" => "MongoDB".to_string(),
+        "redis" => "Redis".to_string(),
+        "duckdb" => "DuckDB".to_string(),
+        "clickhouse" => "ClickHouse".to_string(),
+        "mariadb" => "MariaDB".to_string(),
+        "elasticsearch" => "Elasticsearch".to_string(),
+        "opengauss" => "openGauss".to_string(),
+        "gaussdb" => "GaussDB".to_string(),
+        "dameng" => "DM".to_string(),
+        "dynamodb" => "DynamoDB".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Database".to_string(),
+            }
+        }
+    }
+}
+
+fn default_queries_dir(app: &tauri::AppHandle, db_type: &str, connection_name: &str) -> Result<PathBuf, String> {
+    let documents = app.path().document_dir().map_err(|e| e.to_string())?;
+    let name = sanitize_file_segment(connection_name);
+    Ok(documents.join("DBX").join(queries_type_folder(db_type)).join("servers").join(name))
+}
+
+/// Default Navicat-style queries directory for a connection: every
+/// database-scoped query of the connection lives as a real `.sql` file here
+/// unless the connection or the global setting overrides the location.
+#[tauri::command]
+pub async fn default_saved_sql_dir(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<String, String> {
+    let id = connection_id.trim();
+    if id.is_empty() {
+        return Err("Connection id is empty".to_string());
+    }
+    let config = state
+        .storage
+        .load_connections()
+        .await
+        .ok()
+        .and_then(|configs| configs.into_iter().find(|config| config.id == id));
+    let (db_type, name) = match config {
+        Some(config) => (
+            serde_json::to_value(config.db_type)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "mysql".to_string()),
+            config.name,
+        ),
+        None => ("mysql".to_string(), id.to_string()),
+    };
+    let dir = default_queries_dir(&app, &db_type, &name)?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// Suggested queries directory for a connection draft (before it is saved),
+/// used to prefill folder pickers in the connection dialog.
+#[tauri::command]
+pub async fn suggested_saved_sql_dir(
+    app: tauri::AppHandle,
+    db_type: String,
+    connection_name: String,
+) -> Result<String, String> {
+    let dir = default_queries_dir(&app, &db_type, &connection_name)?;
+    Ok(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -467,6 +550,275 @@ fn open_path(path: &Path) -> Result<(), String> {
     command.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
+// === Navicat-style file-backed saved SQL ===
+
+/// The database-scoped queries of a connection can live in a real directory
+/// (`<dir>/<database>/<query>.sql`, Navicat layout). The filesystem is the
+/// source of truth for these queries.
+const FILE_BACKED_SYNC_DIR_NAME: &str = "dbx-sql-library";
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSqlDirFile {
+    /// Forward-slash path relative to the queries directory, e.g. `robot/update.sql`.
+    pub relative_path: String,
+    pub name: String,
+    pub sql: String,
+}
+
+#[tauri::command]
+pub async fn scan_saved_sql_dir(dir: String) -> Result<Vec<SavedSqlDirFile>, String> {
+    let root = PathBuf::from(dir.trim());
+    if root.as_os_str().is_empty() {
+        return Err("Saved SQL directory is empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut files = Vec::new();
+        scan_saved_sql_dir_recursive(&root, Path::new(""), &mut files);
+        files.sort_by(|a, b| a.relative_path.to_lowercase().cmp(&b.relative_path.to_lowercase()));
+        Ok(files)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn scan_saved_sql_dir_recursive(dir: &Path, relative_dir: &Path, files: &mut Vec<SavedSqlDirFile>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if name == FILE_BACKED_SYNC_DIR_NAME || name.starts_with('.') {
+                continue;
+            }
+            scan_saved_sql_dir_recursive(&path, &relative_dir.join(name), files);
+        } else if file_type.is_file()
+            && !name.starts_with('.')
+            && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+        {
+            if let Ok(sql) = std::fs::read_to_string(&path) {
+                files.push(SavedSqlDirFile {
+                    relative_path: relative_dir.join(name).to_string_lossy().replace('\\', "/"),
+                    name: name.to_string(),
+                    sql,
+                });
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn read_saved_sql_dir_file(path: String) -> Result<String, String> {
+    let path = PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("Saved SQL file path is empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(&path).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn write_saved_sql_dir_file(path: String, sql: String) -> Result<(), String> {
+    let path = PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("Saved SQL file path is empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let parent = path.parent().ok_or_else(|| "Saved SQL file has no parent directory".to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::write(&path, sql.as_bytes()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn delete_saved_sql_dir_file(dir: String, path: String) -> Result<(), String> {
+    let root = PathBuf::from(dir.trim());
+    let path = PathBuf::from(path.trim());
+    if root.as_os_str().is_empty() || path.as_os_str().is_empty() {
+        return Err("Saved SQL directory or file path is empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            remove_empty_parent_dirs(&root, Some(parent));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn rename_saved_sql_dir_file(dir: String, from: String, to: String) -> Result<(), String> {
+    let root = PathBuf::from(dir.trim());
+    let from = PathBuf::from(from.trim());
+    let to = PathBuf::from(to.trim());
+    if root.as_os_str().is_empty() || from.as_os_str().is_empty() || to.as_os_str().is_empty() {
+        return Err("Saved SQL rename source or destination is empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "windows")]
+        if to.exists() {
+            std::fs::remove_file(&to).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+        if let Some(parent) = from.parent() {
+            remove_empty_parent_dirs(&root, Some(parent));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Watches saved SQL directories for external edits and emits a debounceable
+/// `saved-sql-dir-changed` event carrying the directory path.
+#[derive(Default)]
+pub struct SavedSqlDirWatchState {
+    watchers: std::sync::Mutex<HashMap<String, notify::RecommendedWatcher>>,
+}
+
+/// Absolute paths of the files currently on the system clipboard (Windows
+/// `CF_HDROP`). Empty on platforms without a file-drop clipboard.
+#[tauri::command]
+pub async fn clipboard_files() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        clipboard_files_windows()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_files_windows() -> Result<Vec<String>, String> {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    const CF_HDROP: u32 = 15;
+
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("Failed to open the system clipboard".to_string());
+        }
+        let handle = GetClipboardData(CF_HDROP);
+        if handle.is_null() {
+            CloseClipboard();
+            return Ok(Vec::new());
+        }
+        let drop_handle = handle as HDROP;
+        let count = DragQueryFileW(drop_handle, 0xFFFF_FFFF, std::ptr::null_mut(), 0);
+        let mut files = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let length = DragQueryFileW(drop_handle, index, std::ptr::null_mut(), 0);
+            if length == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u16; length as usize + 1];
+            let read = DragQueryFileW(drop_handle, index, buffer.as_mut_ptr(), buffer.len() as u32);
+            if read > 0 {
+                buffer.truncate(read as usize);
+                files.push(String::from_utf16_lossy(&buffer));
+            }
+        }
+        CloseClipboard();
+        Ok(files)
+    }
+}
+
+/// Copies a `.sql` file from the system clipboard source into the connection's
+/// queries directory (`<dir>/<database>/<target_name>`). The target name is
+/// chosen by the frontend with Explorer-style unique naming; an existing
+/// target is rejected rather than overwritten. Returns the absolute path of
+/// the created file.
+#[tauri::command]
+pub async fn paste_saved_sql_file(
+    dir: String,
+    database: String,
+    source_path: String,
+    target_name: String,
+) -> Result<String, String> {
+    let root = PathBuf::from(dir.trim());
+    let database = sanitize_file_segment(&database);
+    let source = PathBuf::from(source_path.trim());
+    let target_name = sanitize_file_segment(&target_name);
+    if root.as_os_str().is_empty() || source.as_os_str().is_empty() || target_name.is_empty() {
+        return Err("Paste source, target name, or queries directory is empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        if !target_name.to_lowercase().ends_with(".sql") {
+            return Err("Only .sql files can be pasted into queries".to_string());
+        }
+        if !source.is_file() {
+            return Err("Paste source is not a file".to_string());
+        }
+        let target_dir = root.join(&database);
+        std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+        let candidate = target_dir.join(&target_name);
+        if candidate.exists() {
+            return Err(format!("A file named '{}' already exists", target_name));
+        }
+        std::fs::copy(&source, &candidate).map_err(|e| e.to_string())?;
+        Ok(candidate.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn watch_saved_sql_dir(
+    app: tauri::AppHandle,
+    state: State<'_, SavedSqlDirWatchState>,
+    dir: String,
+) -> Result<(), String> {
+    let dir_path = PathBuf::from(dir.trim());
+    if dir_path.as_os_str().is_empty() {
+        return Err("Saved SQL directory is empty".to_string());
+    }
+    let key = dir_path.to_string_lossy().to_string();
+    {
+        let watchers = state.watchers.lock().map_err(|e| e.to_string())?;
+        if watchers.contains_key(&key) {
+            return Ok(());
+        }
+    }
+    std::fs::create_dir_all(&dir_path).map_err(|e| e.to_string())?;
+
+    let emit_dir = key.clone();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event.is_ok() {
+            let _ = app.emit("saved-sql-dir-changed", emit_dir.clone());
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    watcher.watch(&dir_path, notify::RecursiveMode::Recursive).map_err(|e| e.to_string())?;
+
+    state.watchers.lock().map_err(|e| e.to_string())?.insert(key, watcher);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unwatch_saved_sql_dir(state: State<'_, SavedSqlDirWatchState>, dir: String) -> Result<(), String> {
+    let key = PathBuf::from(dir.trim()).to_string_lossy().to_string();
+    state.watchers.lock().map_err(|e| e.to_string())?.remove(&key);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +1107,71 @@ mod tests {
             })
             .count();
         assert_eq!(temporary_files, 0);
+    }
+
+    // === Navicat-style file-backed saved SQL ===
+
+    #[test]
+    fn scan_saved_sql_dir_finds_database_scoped_files_with_content() {
+        let target = TestDirectory::new("dir-scan");
+        std::fs::create_dir_all(target.0.join("robot")).unwrap();
+        std::fs::create_dir_all(target.0.join("dbx-sql-library")).unwrap();
+        std::fs::write(target.0.join("robot/更新.sql"), "SELECT 1;").unwrap();
+        std::fs::write(target.0.join("robot/notes.txt"), "ignored").unwrap();
+        std::fs::write(target.0.join("root.sql"), "SELECT 2;").unwrap();
+        std::fs::write(target.0.join("dbx-sql-library/robot/hidden.sql"), "SELECT 3;").unwrap();
+
+        let mut files = Vec::new();
+        scan_saved_sql_dir_recursive(&target.0, Path::new(""), &mut files);
+        files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].relative_path, "robot/更新.sql");
+        assert_eq!(files[0].name, "更新.sql");
+        assert_eq!(files[0].sql, "SELECT 1;");
+        assert_eq!(files[1].relative_path, "root.sql");
+        assert_eq!(files[1].sql, "SELECT 2;");
+    }
+
+    #[test]
+    fn delete_saved_sql_dir_file_prunes_empty_database_folder() {
+        let target = TestDirectory::new("dir-delete");
+        let file = target.0.join("robot/query.sql");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "SELECT 1;").unwrap();
+        std::fs::write(target.0.join("robot/other.sql"), "SELECT 2;").unwrap();
+
+        // Deleting one file keeps the database folder alive.
+        remove_file_and_prune(&target.0, &file);
+        assert!(target.0.join("robot").is_dir());
+        assert!(!file.exists());
+
+        // Deleting the last file prunes the empty database folder but never the root.
+        let other = target.0.join("robot/other.sql");
+        remove_file_and_prune(&target.0, &other);
+        assert!(!target.0.join("robot").exists());
+        assert!(target.0.is_dir());
+    }
+
+    fn remove_file_and_prune(root: &Path, file: &Path) {
+        std::fs::remove_file(file).unwrap();
+        if let Some(parent) = file.parent() {
+            remove_empty_parent_dirs(root, Some(parent));
+        }
+    }
+
+    #[test]
+    fn rename_saved_sql_dir_file_moves_between_database_folders() {
+        let target = TestDirectory::new("dir-rename");
+        let from = target.0.join("robot/old.sql");
+        let to = target.0.join("robot/new.sql");
+        std::fs::create_dir_all(from.parent().unwrap()).unwrap();
+        std::fs::write(&from, "SELECT 1;").unwrap();
+
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "SELECT 1;");
     }
 }

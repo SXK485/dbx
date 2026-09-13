@@ -866,6 +866,7 @@ mod tests {
 
     fn mq_connection(read_only: bool) -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             docs_notes_path: None,
             id: "readonly-mq".to_string(),
             name: "Read only MQ".to_string(),

@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { nextSavedSqlCopyName, savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/savedSql/savedSqlClipboard";
 import { savedSqlExportFileName } from "@/lib/savedSql/savedSqlExport";
 import type { TreeNode } from "@/types/database";
+
+vi.mock("@/i18n", () => ({ currentLocale: () => "zh-CN" }));
 
 describe("saved SQL tree clipboard", () => {
   it("collects unique saved SQL ids from tree rows", () => {
@@ -20,10 +22,11 @@ describe("saved SQL tree clipboard", () => {
     expect(savedSqlPasteTargetForNode({ type: "schema", connectionId: "conn-1", database: "app", schema: "public" })).toBeNull();
   });
 
-  it("uses Navicat-style incrementing copy suffixes", () => {
-    expect(nextSavedSqlCopyName("query.sql", new Set(["query.sql"]))).toBe("query_copy1.sql");
-    expect(nextSavedSqlCopyName("query.sql", new Set(["query.sql", "query_copy1.sql", "QUERY_COPY2.SQL"]))).toBe("query_copy3.sql");
-    expect(nextSavedSqlCopyName("query_copy1.sql", new Set(["query_copy1.sql"]))).toBe("query_copy2.sql");
+  it("uses Explorer-style copy suffixes for pasted queries", () => {
+    expect(nextSavedSqlCopyName("query.sql", new Set(["query.sql"]))).toBe("query - 副本.sql");
+    expect(nextSavedSqlCopyName("query.sql", new Set(["query.sql", "query - 副本.sql"]))).toBe("query - 副本 (2).sql");
+    expect(nextSavedSqlCopyName("query - 副本.sql", new Set(["query - 副本.sql"]))).toBe("query - 副本 (2).sql");
+    expect(nextSavedSqlCopyName("query.sql", new Set(["query.sql", "query - 副本.sql", "query - 副本 (2).sql"]))).toBe("query - 副本 (3).sql");
   });
 
   it("sanitizes exported SQL file names", () => {

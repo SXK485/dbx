@@ -928,6 +928,8 @@ const isRenamingGroup = ref(false);
 
 const isRenamingSavedSql = ref(false);
 
+const isRenamingObject = ref(false);
+
 const renameInput = ref("");
 
 const renameInputRef = ref<HTMLInputElement>();
@@ -947,12 +949,23 @@ function startRenameSavedSql() {
   focusSidebarRenameInput(() => (isRenamingSavedSql.value ? renameInputRef.value : undefined));
 }
 
+const OBJECT_RENAME_NODE_TYPES = new Set<TreeNode["type"]>(["table", "view", "materialized_view", "procedure", "function"]);
+
+function startRenameObject() {
+  if (!OBJECT_RENAME_NODE_TYPES.has(activeNode.value.type)) return;
+  renameInput.value = activeNode.value.label;
+  isRenamingObject.value = true;
+  emit("rename-started");
+  focusSidebarRenameInput(() => (isRenamingObject.value ? renameInputRef.value : undefined));
+}
+
 watch(
   () => props.pendingRename,
   (pending) => {
     if (!pending) return;
     if (activeNode.value.type === "connection-group") startRenameGroup();
     else if (activeNode.value.type === "saved-sql-file") startRenameSavedSql();
+    else if (OBJECT_RENAME_NODE_TYPES.has(activeNode.value.type)) startRenameObject();
   },
   { immediate: true },
 );
@@ -960,7 +973,7 @@ watch(
 function shouldMeasureLabelOverflow(): boolean {
   return shouldMeasureSidebarLabelOverflow({
     hasDetailTooltip: !!detailTooltip.value?.rows.length,
-    isRenaming: isRenamingGroup.value || isRenamingSavedSql.value,
+    isRenaming: isRenamingGroup.value || isRenamingSavedSql.value || isRenamingObject.value,
     usesFullWidthLabel: usesFullWidthLabel.value,
   });
 }
@@ -994,14 +1007,27 @@ async function finishRenameSavedSql() {
   }
 }
 
+function finishRenameObject() {
+  if (!isRenamingObject.value) return;
+  isRenamingObject.value = false;
+  const nodeId = activeNode.value.id;
+  const trimmed = renameInput.value.trim();
+  if (!nodeId || !trimmed || trimmed === activeNode.value.label) return;
+  // The runtime executes the DDL asynchronously and refreshes the tree on
+  // success; failures surface as a toast and the label stays unchanged.
+  treeRuntime.applyObjectRename(nodeId, trimmed);
+}
+
 function finishRename() {
   if (isRenamingSavedSql.value) void finishRenameSavedSql();
+  else if (isRenamingObject.value) finishRenameObject();
   else finishRenameGroup();
 }
 
 function cancelRename() {
   isRenamingGroup.value = false;
   isRenamingSavedSql.value = false;
+  isRenamingObject.value = false;
 }
 
 const PINNED_TREE_NODE_DRAG_TYPE = "__pinned-tree-node__";
@@ -1222,6 +1248,7 @@ watch(
     // from the previously rendered node into the new row.
     isRenamingGroup.value = false;
     isRenamingSavedSql.value = false;
+    isRenamingObject.value = false;
     renameInput.value = "";
     labelOverflowing.value = false;
     suppressNextTableReferenceClick = false;
@@ -1389,13 +1416,15 @@ function onKeydown(event: KeyboardEvent) {
         <div ref="trailingCommentLayoutRef" :class="hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents'">
           <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'" :style="alignedCommentLeadingStyle()">
             <input
-              v-if="isRenamingGroup || isRenamingSavedSql"
+              v-if="isRenamingGroup || isRenamingSavedSql || isRenamingObject"
               ref="renameInputRef"
               v-model="renameInput"
               class="min-w-0 flex-1 truncate bg-transparent border border-primary/50 rounded px-1 outline-none"
               @blur="finishRename"
               @keydown.enter.prevent="finishRename"
               @keydown.escape.prevent="cancelRename"
+              @mousedown.stop
+              @dblclick.stop
               @click.stop
             />
             <span v-else ref="labelRef" :class="[labelWidthClass, { 'flex-1': node.type === 'connection' && !trailingComment }]">{{ visibleLabel(node) }}</span>

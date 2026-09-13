@@ -133,12 +133,23 @@ export const deleteSavedSqlFolder = forward("deleteSavedSqlFolder");
 export const saveSavedSqlFile = forward("saveSavedSqlFile");
 export const deleteSavedSqlFile = forward("deleteSavedSqlFile");
 export const savedSqlStorageDir = forward("savedSqlStorageDir");
+export const defaultSavedSqlDir = forward("defaultSavedSqlDir");
+export const suggestedSavedSqlDir = forward("suggestedSavedSqlDir");
 export const openSavedSqlStorageDir = forward("openSavedSqlStorageDir");
 export const revealPathInFileManager = forward("revealPathInFileManager");
 export const deleteDatabaseBackupFiles = forward("deleteDatabaseBackupFiles");
 export const isSqliteDatabaseFile = forward("isSqliteDatabaseFile");
 export const backupSqliteDatabase = forward("backupSqliteDatabase");
 export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
+export const scanSavedSqlDir = forward("scanSavedSqlDir");
+export const readSavedSqlDirFile = forward("readSavedSqlDirFile");
+export const writeSavedSqlDirFile = forward("writeSavedSqlDirFile");
+export const deleteSavedSqlDirFile = forward("deleteSavedSqlDirFile");
+export const renameSavedSqlDirFile = forward("renameSavedSqlDirFile");
+export const watchSavedSqlDir = forward("watchSavedSqlDir");
+export const unwatchSavedSqlDir = forward("unwatchSavedSqlDir");
+export const clipboardFiles = forward("clipboardFiles");
+export const pasteSavedSqlFile = forward("pasteSavedSqlFile");
 
 // Schema
 export const listDatabases = forward("listDatabases");

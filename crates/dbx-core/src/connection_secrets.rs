@@ -824,6 +824,7 @@ mod tests {
 
     fn connection(id: &str, password: &str, _ssh_password: &str) -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: format!("{id} connection"),

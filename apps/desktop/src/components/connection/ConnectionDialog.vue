@@ -348,6 +348,7 @@ const defaultForm = (): ConnectionForm => ({
   external_config: undefined,
   init_script: undefined,
   docs_notes_path: undefined,
+  saved_sql_dir: undefined,
   read_only: false,
   show_system_schemas: false,
   is_production: false,
@@ -2654,6 +2655,7 @@ watch(
         attached_databases: config.attached_databases || [],
         init_script: config.init_script,
         docs_notes_path: config.docs_notes_path,
+        saved_sql_dir: config.saved_sql_dir,
         read_only: config.read_only || false,
         show_system_schemas: config.show_system_schemas || false,
         is_production: config.is_production || false,
@@ -3911,6 +3913,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
   config.database_info = undefined;
   config.database = normalizeStoredConnectionDatabase(config.db_type, config.database);
   config.note = config.note?.trim() || undefined;
+  config.saved_sql_dir = config.saved_sql_dir?.trim() || undefined;
   if (selectedType.value === "oceanbase" && (config.driver_profile === "oceanbase" || config.driver_profile === "oceanbase-oracle")) {
     Object.assign(config, oceanbaseModeConnectionPatch(oceanbaseSubMode.value));
   }
@@ -4328,6 +4331,31 @@ function connectionConfigSnapshotForVisibleDatabases(): ConnectionConfig {
     id: editingId.value || "draft",
     visible_databases: form.value.visible_databases,
   };
+}
+
+async function chooseSavedSqlDirectory() {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    let defaultPath: string | undefined = form.value.saved_sql_dir?.trim() || undefined;
+    if (!defaultPath) {
+      try {
+        defaultPath = editingId.value ? await api.defaultSavedSqlDir(editingId.value) : await api.suggestedSavedSqlDir(form.value.db_type, form.value.name?.trim() || "Untitled");
+      } catch {
+        defaultPath = undefined;
+      }
+    }
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      recursive: true,
+      title: t("connection.savedSqlDir"),
+      ...(defaultPath ? { defaultPath } : {}),
+    });
+    if (!selected || Array.isArray(selected)) return;
+    form.value.saved_sql_dir = selected;
+  } catch {
+    /* Directory picker unavailable (e.g. web build): keep the typed path. */
+  }
 }
 
 function getUrlParam(params: string | undefined, key: string): string {
@@ -8252,6 +8280,21 @@ function openExternalUrl(url: string) {
                     <Input v-model="form.docs_notes_path" :placeholder="t('connection.docsNotesPathPlaceholder')" spellcheck="false" />
                     <p class="text-xs text-muted-foreground">
                       {{ t("connection.docsNotesPathHint") }}
+                    </p>
+                  </div>
+                </div>
+                <!-- Navicat-style on-disk queries directory for this connection.
+                     Shown for every connection type: database-scoped queries are
+                     always stored as real files in the desktop app. -->
+                <div class="grid grid-cols-4 items-start gap-4">
+                  <Label :class="connectionLabelTopClass">{{ t("connection.savedSqlDir") }}</Label>
+                  <div class="col-span-3 space-y-1">
+                    <div class="flex items-center gap-2">
+                      <Input v-model="form.saved_sql_dir" :placeholder="t('connection.savedSqlDirPlaceholder')" spellcheck="false" />
+                      <Button type="button" variant="outline" size="sm" class="shrink-0" @click="chooseSavedSqlDirectory">{{ t("connection.savedSqlDirBrowse") }}</Button>
+                    </div>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("connection.savedSqlDirHint") }}
                     </p>
                   </div>
                 </div>

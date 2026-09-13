@@ -1283,6 +1283,14 @@ async function startRenamingSavedSqlNode(nodeId: string) {
   store.selectedTreeNodeId = nodeId;
 }
 
+async function startRenamingObjectNode(nodeId: string) {
+  pendingRenameNodeId.value = nodeId;
+  store.selectedTreeNodeId = nodeId;
+  store.selectedTreeNodeIds = [nodeId];
+  await scrollToSidebarNode(nodeId);
+  store.selectedTreeNodeId = nodeId;
+}
+
 async function locateActiveTabInSidebar() {
   const tab = activeTab.value;
   if (!tab) return;
@@ -2121,6 +2129,7 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
       @open-table-name-filters="openSidebarTableNameFilters"
       @request-group-rename="startRenamingCreatedGroup"
       @request-saved-sql-rename="startRenamingSavedSqlNode"
+      @request-object-rename="startRenamingObjectNode"
       @open-danger-dialog="openSidebarDangerDialog"
       @open-dialog-controller="updateSidebarTreeItemDialogController"
       @open-install-extension="openSidebarInstallExtension"

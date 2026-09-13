@@ -30,6 +30,11 @@ pub struct SavedSqlFile {
     pub catalog: Option<String>,
     pub schema: Option<String>,
     pub sql: String,
+    /// Absolute path of the backing `.sql` file when the query lives in a
+    /// Navicat-style on-disk directory (`<queries_dir>/<database>/<name>.sql`).
+    /// The file is the source of truth for file-backed queries.
+    #[serde(default)]
+    pub file_path: Option<String>,
     #[serde(default = "default_sql_loaded")]
     pub sql_loaded: bool,
     #[serde(default)]

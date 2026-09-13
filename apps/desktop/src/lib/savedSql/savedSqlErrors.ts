@@ -13,6 +13,9 @@ export function savedSqlErrorMessage(error: unknown, translate: SavedSqlErrorTra
   if (candidate?.code === "SAVED_SQL_NAME_CONFLICT" && typeof candidate.fileName === "string") {
     return translate("savedSql.nameConflict", { name: candidate.fileName });
   }
+  if (candidate?.code === "SAVED_SQL_INVALID_NAME" && typeof candidate.fileName === "string") {
+    return translate("savedSql.invalidName", { name: candidate.fileName });
+  }
   if (typeof candidate?.message === "string") return candidate.message;
   return String(error);
 }

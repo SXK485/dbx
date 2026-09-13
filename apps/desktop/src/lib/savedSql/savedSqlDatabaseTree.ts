@@ -5,9 +5,12 @@ const savedSqlNameCollator = new Intl.Collator(undefined, { numeric: true, sensi
 
 function savedSqlCopySortKey(name: string): { base: string; copyIndex: number } {
   const base = stripSqlExtension(name);
-  const copyMatch = base.match(/^(.*)_copy(\d+)$/i);
+  // Explorer-style copies ("query - 副本.sql", "query - 副本 (2).sql",
+  // "query - Copy.sql", ...) plus the legacy "query_copy2.sql" pattern.
+  const copyMatch = base.match(/^(.*?)(?:_copy(\d+)| - (?:副本|Copy)(?: \((\d+)\))?)$/i);
   if (!copyMatch?.[1]) return { base, copyIndex: 0 };
-  return { base: copyMatch[1], copyIndex: Number(copyMatch[2]) };
+  const indexText = copyMatch[2] ?? copyMatch[3] ?? "1";
+  return { base: copyMatch[1], copyIndex: Number(indexText) || 1 };
 }
 
 function compareSavedSqlFiles(left: SavedSqlFile, right: SavedSqlFile): number {

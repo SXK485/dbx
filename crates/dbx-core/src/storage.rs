@@ -430,6 +430,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         catalog_name TEXT,
         schema_name TEXT,
         sql_text TEXT NOT NULL DEFAULT '',
+        file_path TEXT,
         order_index INTEGER NOT NULL DEFAULT 0,
         open_count INTEGER NOT NULL DEFAULT 0,
         opened_at TEXT,
@@ -640,6 +641,7 @@ fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
         ("order_index", "INTEGER NOT NULL DEFAULT 0"),
         ("open_count", "INTEGER NOT NULL DEFAULT 0"),
         ("opened_at", "TEXT"),
+        ("file_path", "TEXT"),
     ];
 
     ensure_table_columns(conn, "saved_sql_folders", FOLDER_COLUMNS)?;
@@ -3019,7 +3021,7 @@ impl Storage {
 
             let mut file_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, file_path, order_index, open_count, opened_at, created_at, updated_at \
                      FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -3034,12 +3036,13 @@ impl Storage {
                         catalog: row.get(5)?,
                         schema: row.get(6)?,
                         sql: row.get(7)?,
+                        file_path: row.get(8)?,
                         sql_loaded: true,
-                        order_index: row.get(8)?,
-                        open_count: row.get(9)?,
-                        opened_at: row.get(10)?,
-                        created_at: row.get(11)?,
-                        updated_at: row.get(12)?,
+                        order_index: row.get(9)?,
+                        open_count: row.get(10)?,
+                        opened_at: row.get(11)?,
+                        created_at: row.get(12)?,
+                        updated_at: row.get(13)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3055,7 +3058,7 @@ impl Storage {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, file_path, order_index, open_count, opened_at, created_at, updated_at \
                      FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -3070,12 +3073,13 @@ impl Storage {
                         catalog: row.get(5)?,
                         schema: row.get(6)?,
                         sql: row.get(7)?,
+                        file_path: row.get(8)?,
                         sql_loaded: true,
-                        order_index: row.get(8)?,
-                        open_count: row.get(9)?,
-                        opened_at: row.get(10)?,
-                        created_at: row.get(11)?,
-                        updated_at: row.get(12)?,
+                        order_index: row.get(9)?,
+                        open_count: row.get(10)?,
+                        opened_at: row.get(11)?,
+                        created_at: row.get(12)?,
+                        updated_at: row.get(13)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3112,7 +3116,7 @@ impl Storage {
 
             let mut file_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, file_path, order_index, open_count, opened_at, created_at, updated_at \
                      FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
@@ -3127,12 +3131,13 @@ impl Storage {
                         catalog: row.get(5)?,
                         schema: row.get(6)?,
                         sql: String::new(),
+                        file_path: row.get(7)?,
                         sql_loaded: false,
-                        order_index: row.get(7)?,
-                        open_count: row.get(8)?,
-                        opened_at: row.get(9)?,
-                        created_at: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        order_index: row.get(8)?,
+                        open_count: row.get(9)?,
+                        opened_at: row.get(10)?,
+                        created_at: row.get(11)?,
+                        updated_at: row.get(12)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3149,7 +3154,7 @@ impl Storage {
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at \
+                    "SELECT id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, file_path, order_index, open_count, opened_at, created_at, updated_at \
                      FROM saved_sql_files WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -3163,12 +3168,13 @@ impl Storage {
                     catalog: row.get(5)?,
                     schema: row.get(6)?,
                     sql: row.get(7)?,
+                    file_path: row.get(8)?,
                     sql_loaded: true,
-                    order_index: row.get(8)?,
-                    open_count: row.get(9)?,
-                    opened_at: row.get(10)?,
-                    created_at: row.get(11)?,
-                    updated_at: row.get(12)?,
+                    order_index: row.get(9)?,
+                    open_count: row.get(10)?,
+                    opened_at: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                 })
             }) {
                 Ok(file) => Ok(Some(file)),
@@ -3242,8 +3248,8 @@ impl Storage {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO saved_sql_files \
-                 (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, order_index, open_count, opened_at, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, connection_id, folder_id, name, database_name, catalog_name, schema_name, sql_text, file_path, order_index, open_count, opened_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  folder_id = excluded.folder_id, \
@@ -3251,7 +3257,8 @@ impl Storage {
                  database_name = excluded.database_name, \
                  catalog_name = excluded.catalog_name, \
                  schema_name = excluded.schema_name, \
-                 sql_text = CASE WHEN ?14 THEN excluded.sql_text ELSE saved_sql_files.sql_text END, \
+                 sql_text = CASE WHEN ?15 THEN excluded.sql_text ELSE saved_sql_files.sql_text END, \
+                 file_path = excluded.file_path, \
                  order_index = excluded.order_index, \
                  open_count = excluded.open_count, \
                  opened_at = excluded.opened_at, \
@@ -3265,6 +3272,7 @@ impl Storage {
                     file.catalog,
                     file.schema,
                     file.sql,
+                    file.file_path,
                     file.order_index,
                     file.open_count,
                     file.opened_at,
@@ -4654,6 +4662,7 @@ mod tests {
 
     fn mq_connection(id: &str, token: &str) -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "Pulsar".to_string(),
@@ -4721,6 +4730,7 @@ mod tests {
 
     fn nacos_connection(id: &str, password: &str) -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             docs_notes_path: None,
             id: id.to_string(),
             name: "Nacos".to_string(),
@@ -6098,6 +6108,7 @@ mod tests {
             catalog: Some("hive".to_string()),
             schema: None,
             sql: "SELECT * FROM very_large_table;".repeat(100),
+            file_path: None,
             sql_loaded: true,
             order_index: 0,
             open_count: 0,
@@ -6139,6 +6150,7 @@ mod tests {
             catalog: None,
             schema: None,
             sql: "SELECT 1;".to_string(),
+            file_path: None,
             sql_loaded: true,
             order_index: 0,
             open_count: 0,
@@ -6207,6 +6219,7 @@ mod tests {
             database: "analytics".to_string(),
             schema: None,
             sql: "SELECT 2;".to_string(),
+            file_path: None,
             sql_loaded: true,
             order_index: 1,
             open_count: 0,

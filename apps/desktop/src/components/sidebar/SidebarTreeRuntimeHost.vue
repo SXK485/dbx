@@ -359,6 +359,7 @@ const emit = defineEmits<{
   "rename-started": [];
   "request-group-rename": [groupId: string];
   "request-saved-sql-rename": [nodeId: string];
+  "request-object-rename": [nodeId: string];
   "node-toggled": [node: TreeNode, expanded: boolean];
   "search-toggle": [node: TreeNode];
   "context-menu": [event: MouseEvent, node: TreeNode, items: ContextMenuItem[]];
@@ -987,9 +988,26 @@ function isEditableShortcutTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable || !!target.closest("[contenteditable='true']");
 }
 
+/**
+ * Whether Ctrl+C should still perform the file-level copy for the active
+ * saved SQL node even though focus sits in the SQL editor. Mirrors
+ * Explorer/Navicat: the tree keeps its selection while the editor is focused,
+ * so copying with a collapsed cursor copies the FILE, not empty text.
+ */
+function isSavedSqlFileCopyTarget(): boolean {
+  const node = activeNode.value;
+  if (node.type === "saved-sql-file") return true;
+  const selected = selectedTreeNodesInVisibleOrder();
+  return selected.length > 0 && selected.some((item) => item.type === "saved-sql-file");
+}
+
 function onKeydown(event: KeyboardEvent) {
   claimTreeItemDialogOwnership();
-  if ((!isSelected.value && !isMultiSelected.value) || isEditableShortcutTarget(event.target)) return;
+  const editableTarget = isEditableShortcutTarget(event.target);
+  const selection = typeof window !== "undefined" ? window.getSelection() : null;
+  const hasTextSelection = !!selection && !selection.isCollapsed;
+  const editorFileCopy = editableTarget && !hasTextSelection && isCopyTreeSelectionShortcut(event) && isSavedSqlFileCopyTarget();
+  if ((!isSelected.value && !isMultiSelected.value) || (editableTarget && !editorFileCopy)) return;
   if (isPasteTreeClipboardShortcut(event)) {
     if (!requestPasteTreeClipboard()) return;
     event.preventDefault();
@@ -1120,6 +1138,11 @@ function requestPasteTreeClipboard(): boolean {
       .catch((e: unknown) => toast(t("savedSql.pasteFailed", { message: savedSqlErrorMessage(e, t) }), 5000));
     return true;
   }
+  // Pasting .sql files straight from the system clipboard into a database's
+  // queries folder (Navicat-style), e.g. after Ctrl+C on a file in Explorer.
+  if (activeNode.value.type === "saved-sql-root") {
+    return pasteSqlFilesFromSystemClipboard();
+  }
   if (currentDatabaseType() === "victoriametrics") return false;
   if (clipboard?.kind === "connection-copy") {
     const targetGroupId = connectionPasteTargetGroupId(activeNode.value, (connectionId) => connectionStore.groupIdForConnection(connectionId));
@@ -1174,7 +1197,9 @@ function requestRenameSelectedNode(): boolean {
     return true;
   }
   if (canRenameObject.value) {
-    openRenameObjectDialog();
+    // Inline rename (Explorer/Navicat style): the tree row switches into an
+    // input; Enter executes the DDL through applyObjectRename.
+    emit("request-object-rename", activeNode.value.id);
     return true;
   }
   if (activeNode.value.type === "connection-group") {
@@ -1192,6 +1217,10 @@ function openRenameMongoCollectionDialog() {
   claimTreeItemDialogOwnership();
   routeTreeItemDialogController();
   prepareRenameMongoCollectionDialog();
+}
+
+function requestInlineObjectRename() {
+  if (activeNode.value.id) emit("request-object-rename", activeNode.value.id);
 }
 
 function openCloneMongoCollectionDialog() {
@@ -1356,6 +1385,50 @@ async function openSavedSqlFile() {
   const tabId = queryStore.openSavedSql(file);
   connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
   void savedSqlStore.recordFileUsage(file.id);
+}
+
+async function revealSavedSqlFileInFolder() {
+  const node = activeNode.value;
+  if (node.type !== "saved-sql-file" || !node.savedSqlId) return;
+  const file = savedSqlStore.getFile(node.savedSqlId);
+  if (!file?.filePath) return;
+  try {
+    await api.revealPathInFileManager(file.filePath);
+  } catch (error: unknown) {
+    toast(t("savedSql.revealFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
+  }
+}
+
+async function refreshSavedSqlQueries() {
+  const node = activeNode.value;
+  if (!node.connectionId) return;
+  try {
+    await savedSqlStore.refreshConnectionDir(node.connectionId);
+    toast(t("savedSql.queriesRefreshed"), 2000);
+  } catch (error: unknown) {
+    toast(t("savedSql.queriesRefreshFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
+  }
+}
+
+function pasteSqlFilesFromSystemClipboard(): boolean {
+  const node = activeNode.value;
+  if (node.type !== "saved-sql-root" || !node.connectionId || typeof node.database !== "string") return false;
+  void api
+    .clipboardFiles()
+    .then((files) => files.filter((file) => file.toLowerCase().endsWith(".sql")))
+    .then(async (sqlFiles) => {
+      if (sqlFiles.length === 0) {
+        toast(t("savedSql.noClipboardFiles"), 3000);
+        return;
+      }
+      const created = await savedSqlStore.pasteFilesIntoDatabase(node.connectionId!, node.database as string, sqlFiles);
+      if (created.length > 0) toast(t("savedSql.pastedFiles", { count: created.length }), 2000);
+      else toast(t("savedSql.pasteFilesFailed", { message: "" }), 5000);
+    })
+    .catch((error: unknown) => {
+      toast(t("savedSql.pasteFilesFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
+    });
+  return true;
 }
 
 async function copySavedSqlFiles() {
@@ -2462,15 +2535,6 @@ const canRenameObject = computed(() => {
   return !!objectType && (supportsObjectRename(currentDatabaseType(), objectType) || supportsSourceBackedRoutineRename(currentDatabaseType(), objectType as any));
 });
 
-function openRenameObjectDialog() {
-  claimTreeItemDialogOwnership();
-  routeTreeItemDialogController();
-  renameObjectName.value = activeNode.value.label;
-  renameObjectError.value = "";
-  renameObjectPreviewSql.value = "";
-  showRenameObjectDialog.value = true;
-}
-
 async function executeTreeNodeSqlWithProductionGuard(node: Pick<TreeNode, "connectionId" | "database" | "schema">, sql: string, options: { database?: string; schema?: string; executeAsScript?: boolean } = {}) {
   if (!node.connectionId) return undefined;
   const database = options.database ?? node.database ?? "";
@@ -2563,6 +2627,52 @@ async function confirmRenameObject() {
       connectionStore.removePinnedTreeNodes([node]);
     }
     renameObjectError.value = e?.message || String(e);
+  }
+}
+
+/**
+ * Inline rename entry point (F2 / context menu): executes the object rename
+ * DDL for the tree node with the given id. Mirrors the rename dialog's logic
+ * without the preview step; production guards still apply.
+ */
+async function applyObjectRename(nodeId: string, newName: string) {
+  const node = flattenTree(connectionStore.treeNodes).find((item) => item.node.id === nodeId)?.node;
+  const objectType = node?.type === "table" ? "TABLE" : node?.type === "view" ? "VIEW" : node?.type === "materialized_view" ? "MATERIALIZED_VIEW" : node?.type === "procedure" ? "PROCEDURE" : node?.type === "function" ? "FUNCTION" : null;
+  const trimmed = newName.trim();
+  if (!node || !objectType || !trimmed || trimmed === node.label || !node.connectionId || !node.database) return;
+  try {
+    const dbType = databaseTypeForNode(node);
+    await connectionStore.ensureConnected(node.connectionId);
+    if (supportsSourceBackedRoutineRename(dbType, objectType as any)) {
+      const schema = node.schema || node.database;
+      const source = await api.getObjectSource(node.connectionId, node.database, schema, node.objectName || node.label, objectType as any, node.signature);
+      const statements = await buildRoutineRenameObjectSourceStatements({
+        databaseType: dbType!,
+        objectType: objectType as any,
+        schema,
+        name: node.label,
+        newName: trimmed,
+        source: source.source,
+      });
+      for (const sql of statements) {
+        await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema });
+      }
+    } else {
+      const sql = await buildRenameObjectSql({
+        databaseType: dbType,
+        objectType,
+        schema: node.schema,
+        oldName: node.label,
+        newName: trimmed,
+      });
+      await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema: node.schema });
+    }
+    toast(t("contextMenu.renameObjectSuccess", { oldName: node.label, newName: trimmed }), 3000);
+    const renamedNode: TreeNode = { ...node, label: trimmed, objectName: trimmed, tableName: trimmed };
+    await refreshTableList(node);
+    connectionStore.replacePinnedTreeNode(node, renamedNode);
+  } catch (e: any) {
+    toast(t("contextMenu.renameObjectFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
@@ -4834,6 +4944,14 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   const { node, items } = context;
 
   if (node.type === "saved-sql-root") {
+    items.push({ label: t("savedSql.refreshQueries"), action: refreshSavedSqlQueries, icon: RefreshCw });
+    items.push({
+      label: t("savedSql.pasteSqlFiles"),
+      action: () => pasteSqlFilesFromSystemClipboard(),
+      icon: Clipboard,
+      shortcut: shortcutPaste.value,
+    });
+    items.push({ label: "", separator: true });
     items.push({
       label: t("savedSql.pasteFile"),
       action: () => requestPasteTreeClipboard(),
@@ -4845,6 +4963,7 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   }
 
   if (node.type === "saved-sql-file") {
+    const file = node.savedSqlId ? savedSqlStore.getFile(node.savedSqlId) : undefined;
     items.push({ label: t("savedSql.open"), action: openSavedSqlFile, icon: FileCode });
     items.push({ label: "", separator: true });
     items.push({ label: t("savedSql.copyFile"), action: copySavedSqlFiles, icon: Copy, shortcut: shortcutCopyName.value });
@@ -4856,6 +4975,9 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       disabled: connectionStore.treeClipboard?.kind !== "saved-sql-copy" || !savedSqlPasteTargetForNode(node),
     });
     items.push({ label: t("sqlLibrary.exportFile"), action: exportSavedSqlFile, icon: Upload });
+    if (file?.filePath) {
+      items.push({ label: t("savedSql.revealInFolder"), action: revealSavedSqlFileInFolder, icon: FolderOpen });
+    }
     items.push({ label: "", separator: true });
     items.push({ label: t("savedSql.renameFile"), action: renameSavedSqlFile, icon: Pencil, shortcut: shortcutRename });
     items.push({ label: "", separator: true });
@@ -5069,7 +5191,7 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (canRenameObject.value) {
       items.push({
         label: t("contextMenu.renameObject"),
-        action: openRenameObjectDialog,
+        action: requestInlineObjectRename,
         icon: Pencil,
         shortcut: shortcutRename,
       });
@@ -5233,7 +5355,7 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (!isPackageMember && canRenameObject.value) {
       items.push({
         label: t("contextMenu.renameObject"),
-        action: openRenameObjectDialog,
+        action: requestInlineObjectRename,
         icon: Pencil,
         shortcut: shortcutRename,
       });
@@ -5558,6 +5680,7 @@ defineExpose({
   openDataInNewTab,
   requestPaste,
   toggleNode,
+  applyObjectRename,
 });
 </script>
 

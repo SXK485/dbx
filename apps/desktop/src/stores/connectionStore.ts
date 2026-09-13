@@ -7330,6 +7330,10 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function persistConnections(nextConnections: ConnectionConfig[] = connections.value) {
     await api.saveConnections(nextConnections.filter((connection) => connection.one_time !== true));
+    // A saved connection may have gained/changed its Navicat-style queries
+    // directory; re-reconcile file-backed saved SQL for the new configuration.
+    const savedSqlStore = useSavedSqlStore();
+    void savedSqlStore.reconcileFileBackedDirectories().catch((error) => console.warn("[DBX][connections:dir-reconcile]", error));
   }
 
   function sameIds(left: string[], right: string[]) {
@@ -8056,6 +8060,9 @@ export const useConnectionStore = defineStore("connection", () => {
           savedLayout ?? currentLayout,
         );
         rebuildTreeNodes();
+        // Materialize Navicat-style file-backed queries for the loaded
+        // connections (scan + migrate legacy internal queries to files).
+        void savedSqlStore.reconcileFileBackedDirectories().catch((error) => console.warn("[DBX][connections:dir-reconcile]", error));
       })().finally(() => {
         initFromDiskPromise = null;
       });

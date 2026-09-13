@@ -225,6 +225,7 @@ mod tests {
     fn mongodb_config() -> ConnectionConfig {
         ConnectionConfig {
             docs_notes_path: None,
+            saved_sql_dir: None,
             id: "mongo".to_string(),
             name: "MongoDB".to_string(),
             note: String::new(),
@@ -675,6 +676,7 @@ mod tests {
     /// Dropped-file preview connection: in-memory DuckDB, `one_time`, never in the saved list.
     fn duckdb_preview_config() -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             id: "preview-duckdb".to_string(),
             name: "[Preview] sales.parquet".to_string(),
             db_type: DatabaseType::DuckDb,

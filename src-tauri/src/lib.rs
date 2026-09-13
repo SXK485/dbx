@@ -1467,6 +1467,7 @@ pub fn run() {
             app.manage(state.clone());
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
+            app.manage(commands::saved_sql::SavedSqlDirWatchState::default());
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
@@ -1984,8 +1985,19 @@ pub fn run() {
             commands::saved_sql::save_saved_sql_file,
             commands::saved_sql::delete_saved_sql_file,
             commands::saved_sql::saved_sql_storage_dir,
+            commands::saved_sql::default_saved_sql_dir,
+            commands::saved_sql::suggested_saved_sql_dir,
             commands::saved_sql::open_saved_sql_storage_dir,
             commands::saved_sql::sync_saved_sql_directory,
+            commands::saved_sql::scan_saved_sql_dir,
+            commands::saved_sql::read_saved_sql_dir_file,
+            commands::saved_sql::write_saved_sql_dir_file,
+            commands::saved_sql::delete_saved_sql_dir_file,
+            commands::saved_sql::rename_saved_sql_dir_file,
+            commands::saved_sql::watch_saved_sql_dir,
+            commands::saved_sql::unwatch_saved_sql_dir,
+            commands::saved_sql::clipboard_files,
+            commands::saved_sql::paste_saved_sql_file,
             commands::fs_open::reveal_path_in_file_manager,
             commands::fs_open::is_sqlite_database_file,
             commands::fs_open::delete_database_backup_files,

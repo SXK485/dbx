@@ -109,6 +109,12 @@ pub struct ConnectionConfig {
     /// desktop app; the CLI takes an explicit `--notes` path instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs_notes_path: Option<String>,
+    /// Directory where this connection's database-scoped saved SQL queries
+    /// live as real `.sql` files (Navicat-style `<dir>/<database>/<name>.sql`).
+    /// The filesystem is the source of truth for queries in this directory.
+    /// Falls back to the global saved SQL base directory when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_sql_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transport_layers: Vec<TransportLayerConfig>,
     #[serde(default = "default_connect_timeout_secs")]
@@ -649,6 +655,8 @@ struct ConnectionConfigData {
     #[serde(default)]
     pub docs_notes_path: Option<String>,
     #[serde(default)]
+    pub saved_sql_dir: Option<String>,
+    #[serde(default)]
     pub transport_layers: Vec<TransportLayerConfig>,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
@@ -742,6 +750,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             init_script: data.init_script,
             color: data.color,
             docs_notes_path: data.docs_notes_path,
+            saved_sql_dir: data.saved_sql_dir,
             transport_layers: data.transport_layers,
             connect_timeout_secs: data.connect_timeout_secs,
             query_timeout_secs: data.query_timeout_secs,
@@ -2473,6 +2482,7 @@ mod tests {
 
     fn mysql_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             docs_notes_path: None,
             id: "id".to_string(),
             name: "name".to_string(),

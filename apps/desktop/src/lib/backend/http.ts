@@ -40,6 +40,7 @@ import type {
   JdbcPluginStatus,
   SidebarLayout,
   SavedSqlFile,
+  SavedSqlDirFile,
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
@@ -701,6 +702,14 @@ export async function savedSqlStorageDir(): Promise<string> {
   return "";
 }
 
+export async function defaultSavedSqlDir(_connectionId: string): Promise<string> {
+  throw new Error("Saved SQL directories are only available in the desktop app.");
+}
+
+export async function suggestedSavedSqlDir(_dbType: string, _connectionName: string): Promise<string> {
+  throw new Error("Saved SQL directories are only available in the desktop app.");
+}
+
 export async function openSavedSqlStorageDir(_dir?: string | null): Promise<void> {
   throw new Error("SQL storage directory is only available in the desktop app.");
 }
@@ -723,6 +732,42 @@ export async function backupSqliteDatabase(_connectionId: string, _destinationPa
 
 export async function syncSavedSqlDirectory(_request: SavedSqlSyncRequest): Promise<void> {
   throw new Error("SQL directory sync is only available in the desktop app.");
+}
+
+export async function scanSavedSqlDir(_dir: string): Promise<SavedSqlDirFile[]> {
+  throw new Error("Saved SQL directory scanning is only available in the desktop app.");
+}
+
+export async function readSavedSqlDirFile(_path: string): Promise<string> {
+  throw new Error("Saved SQL directory access is only available in the desktop app.");
+}
+
+export async function writeSavedSqlDirFile(_path: string, _sql: string): Promise<void> {
+  throw new Error("Saved SQL directory access is only available in the desktop app.");
+}
+
+export async function deleteSavedSqlDirFile(_dir: string, _path: string): Promise<void> {
+  throw new Error("Saved SQL directory access is only available in the desktop app.");
+}
+
+export async function renameSavedSqlDirFile(_dir: string, _from: string, _to: string): Promise<void> {
+  throw new Error("Saved SQL directory access is only available in the desktop app.");
+}
+
+export async function watchSavedSqlDir(_dir: string): Promise<void> {
+  throw new Error("Saved SQL directory watching is only available in the desktop app.");
+}
+
+export async function unwatchSavedSqlDir(_dir: string): Promise<void> {
+  throw new Error("Saved SQL directory watching is only available in the desktop app.");
+}
+
+export async function clipboardFiles(): Promise<string[]> {
+  return [];
+}
+
+export async function pasteSavedSqlFile(_dir: string, _database: string, _sourcePath: string, _targetName: string): Promise<string> {
+  throw new Error("Pasting SQL files is only available in the desktop app.");
 }
 
 // ---------------------------------------------------------------------------

@@ -638,6 +638,7 @@ mod tests {
 
     fn config() -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             docs_notes_path: None,
             id: "conn".to_string(),
             name: "test".to_string(),

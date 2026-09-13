@@ -39,6 +39,8 @@ export interface DesktopSettings {
   duckdb_worker_process_isolation: boolean;
   duckdb_worker_max_processes: number;
   saved_sql_sync_dir?: string | null;
+  /** Global default directory for Navicat-style file-backed saved SQL queries. */
+  saved_sql_base_dir?: string | null;
   driver_store_dir?: string | null;
   plugin_store_dir?: string | null;
   agent_store_dir?: string | null;
@@ -76,6 +78,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   duckdb_worker_process_isolation: false,
   duckdb_worker_max_processes: DUCKDB_WORKER_MAX_PROCESSES_DEFAULT,
   saved_sql_sync_dir: null,
+  saved_sql_base_dir: null,
   driver_store_dir: null,
   plugin_store_dir: null,
   agent_store_dir: null,
@@ -112,6 +115,7 @@ export function normalizeDesktopSettings(settings: Partial<DesktopSettings> | nu
     duckdb_worker_process_isolation: settings?.duckdb_worker_process_isolation ?? DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation,
     duckdb_worker_max_processes: normalizeDuckDbWorkerMaxProcesses(settings?.duckdb_worker_max_processes),
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
+    saved_sql_base_dir: settings?.saved_sql_base_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_base_dir,
     driver_store_dir: settings?.driver_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.driver_store_dir,
     plugin_store_dir: settings?.plugin_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.plugin_store_dir,
     agent_store_dir: settings?.agent_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.agent_store_dir,
@@ -790,7 +794,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   cellDetailMetadataCollapsed: false,
   shortcuts: normalizeShortcutSettings(),
   sqlFormatter: normalizeSqlFormatterSettings(DEFAULT_SQL_FORMATTER_SETTINGS),
-  sidebarActivation: "single",
+  sidebarActivation: "double",
   sidebarConnectionSortMode: "manual",
   sidebarObjectDisplay: "grouped",
   routineSourceOpenMode: "query-tab",

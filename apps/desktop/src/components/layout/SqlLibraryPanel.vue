@@ -282,6 +282,49 @@ async function disableSyncDirectory() {
   }
 }
 
+async function chooseQueriesDirectory() {
+  if (!isTauriRuntime()) {
+    toast(t("sqlLibrary.desktopOnly"), 4000);
+    return;
+  }
+
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      recursive: true,
+      title: t("sqlLibrary.chooseQueriesDirectory"),
+    });
+    if (!selected || Array.isArray(selected)) return;
+
+    await settingsStore.updateDesktopSettings({ saved_sql_base_dir: selected });
+    await savedSqlStore.reconcileFileBackedDirectories();
+    toast(t("sqlLibrary.queriesDirectorySaved"), 2500);
+  } catch (e: any) {
+    toast(t("sqlLibrary.queriesDirectoryFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function disableQueriesDirectory() {
+  try {
+    await settingsStore.updateDesktopSettings({ saved_sql_base_dir: null });
+    await savedSqlStore.reconcileFileBackedDirectories();
+    toast(t("sqlLibrary.queriesDirectoryDisabled"), 2500);
+  } catch (e: any) {
+    toast(t("sqlLibrary.queriesDirectoryFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function revealFileInFolder(file: SavedSqlFile) {
+  if (!file.filePath) return;
+  try {
+    await api.revealPathInFileManager(file.filePath);
+  } catch (e: any) {
+    toast(t("savedSql.revealFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
 async function openSqlStorageDirectory() {
   if (!isTauriRuntime()) {
     toast(t("sqlLibrary.desktopOnly"), 4000);
@@ -845,6 +888,14 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
         icon: X,
         visible: !!settingsStore.desktopSettings.saved_sql_sync_dir,
       },
+      { label: "", separator: true },
+      { label: t("sqlLibrary.chooseQueriesDirectory"), action: chooseQueriesDirectory, icon: FolderCog },
+      {
+        label: t("sqlLibrary.disableQueriesDirectory"),
+        action: disableQueriesDirectory,
+        icon: X,
+        visible: !!settingsStore.desktopSettings.saved_sql_base_dir,
+      },
     ];
   }
   if ("sql" in target) {
@@ -857,6 +908,7 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
         disabled: !hasCurrentSavedSqlExecutionTarget.value,
       },
       { label: t("sqlLibrary.exportFile"), action: () => exportSingleFile(target), icon: Upload },
+      { label: t("savedSql.revealInFolder"), action: () => revealFileInFolder(target), icon: FolderOpen, visible: !!target.filePath },
       { label: t("sqlLibrary.moveToFolder"), icon: FolderClosed, children: folderMoveMenuItems([target.id]) },
       { label: "", separator: true },
       { label: t("savedSql.renameFile"), action: () => startRenameFile(target), icon: Pencil },

@@ -22,6 +22,7 @@ export interface SidebarTreeRuntimeHost {
   openDataInNewTab(node: TreeNode): void;
   requestPaste(node: TreeNode): boolean;
   toggleNode(node: TreeNode): void;
+  applyObjectRename(nodeId: string, newName: string): void;
 }
 
 export type SidebarTreeRuntimeHostInstance = ComponentPublicInstance & SidebarTreeRuntimeHost;
@@ -43,6 +44,7 @@ export interface SidebarTreeRuntime {
   openDataInNewTab(node: TreeNode): void;
   requestPaste(node: TreeNode): boolean;
   toggleNode(node: TreeNode): void;
+  applyObjectRename(nodeId: string, newName: string): void;
   dispose(): void;
 }
 
@@ -110,6 +112,9 @@ export function createSidebarTreeRuntime(): SidebarTreeRuntime {
     },
     toggleNode(node) {
       currentHost()?.toggleNode(node);
+    },
+    applyObjectRename(nodeId, newName) {
+      currentHost()?.applyObjectRename(nodeId, newName);
     },
     dispose() {
       if (disposed) return;

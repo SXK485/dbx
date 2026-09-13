@@ -36,6 +36,7 @@ deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 rust_decimal = { version = "1", features = ["serde", "db-postgres"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-deep-link = "2"
@@ -80,4 +81,4 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 libloading = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Shell"] }

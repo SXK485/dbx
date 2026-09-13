@@ -5383,6 +5383,7 @@ mod tests {
 
     fn redis_test_connection_config() -> ConnectionConfig {
         ConnectionConfig {
+            saved_sql_dir: None,
             docs_notes_path: None,
             id: "redis".to_string(),
             name: "Redis".to_string(),

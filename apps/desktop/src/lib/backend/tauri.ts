@@ -53,6 +53,7 @@ import type {
   JdbcMavenBundleInfo,
   JdbcPluginStatus,
   SavedSqlFile,
+  SavedSqlDirFile,
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
@@ -2006,6 +2007,14 @@ export async function savedSqlStorageDir(): Promise<string> {
   return invoke("saved_sql_storage_dir");
 }
 
+export async function defaultSavedSqlDir(connectionId: string): Promise<string> {
+  return invoke("default_saved_sql_dir", { connectionId });
+}
+
+export async function suggestedSavedSqlDir(dbType: string, connectionName: string): Promise<string> {
+  return invoke("suggested_saved_sql_dir", { dbType, connectionName });
+}
+
 export async function openSavedSqlStorageDir(dir?: string | null): Promise<void> {
   return invoke("open_saved_sql_storage_dir", { dir });
 }
@@ -2028,6 +2037,42 @@ export async function backupSqliteDatabase(connectionId: string, destinationPath
 
 export async function syncSavedSqlDirectory(request: SavedSqlSyncRequest): Promise<void> {
   return invoke("sync_saved_sql_directory", { request });
+}
+
+export async function scanSavedSqlDir(dir: string): Promise<SavedSqlDirFile[]> {
+  return invoke("scan_saved_sql_dir", { dir });
+}
+
+export async function readSavedSqlDirFile(path: string): Promise<string> {
+  return invoke("read_saved_sql_dir_file", { path });
+}
+
+export async function writeSavedSqlDirFile(path: string, sql: string): Promise<void> {
+  return invoke("write_saved_sql_dir_file", { path, sql });
+}
+
+export async function deleteSavedSqlDirFile(dir: string, path: string): Promise<void> {
+  return invoke("delete_saved_sql_dir_file", { dir, path });
+}
+
+export async function renameSavedSqlDirFile(dir: string, from: string, to: string): Promise<void> {
+  return invoke("rename_saved_sql_dir_file", { dir, from, to });
+}
+
+export async function watchSavedSqlDir(dir: string): Promise<void> {
+  return invoke("watch_saved_sql_dir", { dir });
+}
+
+export async function unwatchSavedSqlDir(dir: string): Promise<void> {
+  return invoke("unwatch_saved_sql_dir", { dir });
+}
+
+export async function clipboardFiles(): Promise<string[]> {
+  return invoke("clipboard_files");
+}
+
+export async function pasteSavedSqlFile(dir: string, database: string, sourcePath: string, targetName: string): Promise<string> {
+  return invoke("paste_saved_sql_file", { dir, database, sourcePath, targetName });
 }
 
 export async function saveSidebarLayout(layout: import("@/types/database").SidebarLayout): Promise<void> {

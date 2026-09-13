@@ -11349,6 +11349,7 @@ SELECT 1 FROM dual"#
     fn resolve_external_transfer_catalog_for_config_accepts_starrocks_driver_profile() {
         let config = crate::models::connection::ConnectionConfig {
             docs_notes_path: None,
+            saved_sql_dir: None,
             id: "sr".to_string(),
             name: "sr".to_string(),
             note: String::new(),

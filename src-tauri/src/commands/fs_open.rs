@@ -26,15 +26,21 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+
         // `/select,<path>` must be passed as a single argument with no space
-        // after the comma. `Command::arg` does not invoke a shell, so the path
-        // is forwarded as-is — spaces and non-ASCII characters survive.
-        let arg = format!("/select,{}", path.display());
-        dbx_core::process::new_std_command("explorer")
-            .arg(arg)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("failed to launch Explorer: {e}"))
+        // after the comma, and the path must be quoted: Explorer re-parses its
+        // own command line, so unquoted paths containing spaces (common in
+        // query names such as "query - 副本 (2).sql") are truncated and open
+        // the default folder instead. `raw_arg` forwards the argument verbatim
+        // (no shell, no re-quoting), so Explorer receives the exact
+        // `/select,"<path>"` form it expects. Forward slashes are normalized
+        // to backslashes because Explorer does not parse them inside `/select`.
+        let normalized = path.to_string_lossy().replace('/', "\\");
+        let arg = format!("/select,\"{normalized}\"");
+        let mut command = dbx_core::process::new_std_command("explorer");
+        command.raw_arg(arg);
+        command.spawn().map(|_| ()).map_err(|e| format!("failed to launch Explorer: {e}"))
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]

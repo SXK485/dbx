@@ -3,12 +3,47 @@ import { computed, ref } from "vue";
 import { uuid } from "@/lib/common/utils";
 import * as api from "@/lib/backend/api";
 import { forgetSavedSqlEditorPosition } from "@/lib/app/savedSqlEditorPosition";
-import { ensureSqlExtension } from "@/lib/savedSql/savedSqlFileName";
+import { ensureSqlExtension, invalidSavedSqlNameReason, type InvalidSavedSqlNameReason } from "@/lib/savedSql/savedSqlFileName";
 import { nextSavedSqlCopyName } from "@/lib/savedSql/savedSqlClipboard";
 import { savedSqlDatabaseScopeKey } from "@/lib/savedSql/savedSqlDatabaseTree";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { SavedSqlFile, SavedSqlFolder, SavedSqlLibrary } from "@/types/database";
+import type { SavedSqlFile, SavedSqlFolder, SavedSqlLibrary, TreeNode } from "@/types/database";
+
+// === Navicat-style file-backed saved SQL ===
+
+function isWindowsRuntime(): boolean {
+  return typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent);
+}
+
+/** `<dir>/<database>/<name>.sql` absolute path for a file-backed query. */
+function savedSqlAbsPath(dir: string, relativePath: string): string {
+  const separator = isWindowsRuntime() ? "\\" : "/";
+  return `${dir.replace(/[\\/]+$/, "")}${separator}${relativePath.replace(/[\\/]/g, separator)}`;
+}
+
+/** Relative path under `dir`, or null when the file lives elsewhere. */
+function savedSqlRelativeUnderDir(filePath: string, dir: string): string | null {
+  const normalizedFile = filePath.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedDir = dir.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (normalizedFile.length <= normalizedDir.length + 1) return null;
+  if (!normalizedFile.toLowerCase().startsWith(normalizedDir.toLowerCase() + "/")) return null;
+  return normalizedFile.slice(normalizedDir.length + 1);
+}
+
+/** Database folder name for a relative path; only `<database>/<name>.sql` files qualify. */
+function savedSqlDatabaseFromRelativePath(relativePath: string): string | undefined {
+  const parts = relativePath.split("/");
+  return parts.length === 2 ? parts[0] : undefined;
+}
+
+/** The queries directory implied by a file path (`<dir>/<db>/<name>.sql` → `<dir>`). */
+function savedSqlDirFromFilePath(filePath: string): string {
+  const parts = filePath.replace(/\\/g, "/").split("/");
+  parts.pop();
+  parts.pop();
+  return parts.join("/") || filePath;
+}
 
 const LEGACY_STORAGE_KEY = "dbx-saved-sql-library";
 
@@ -55,6 +90,18 @@ export class SavedSqlNameConflictError extends Error {
   constructor(readonly fileName: string) {
     super(`SQL "${fileName}" already exists in this location.`);
     this.name = "SavedSqlNameConflictError";
+  }
+}
+
+export class SavedSqlInvalidNameError extends Error {
+  readonly code = "SAVED_SQL_INVALID_NAME";
+
+  constructor(
+    readonly fileName: string,
+    readonly reason: InvalidSavedSqlNameReason,
+  ) {
+    super(`The file name is invalid: "${fileName}"`);
+    this.name = "SavedSqlInvalidNameError";
   }
 }
 
@@ -161,6 +208,334 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   const persistedFileTargets = new Map<string, SavedSqlExecutionTargetInput & { updatedAt: string }>();
   const pendingNamesByScope = new Map<string, Map<string, PendingSavedSqlName>>();
 
+  // File-backed directory state: resolved queries directory per connection and
+  // debounce/suppression plumbing for external file-change events.
+  const fileDirsByConnection = new Map<string, string>();
+  const dirRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const watchedDirs = new Set<string>();
+  let dirWatchStarted = false;
+  let ownWriteSuppressionUntil = 0;
+
+  function suppressDirEvents() {
+    ownWriteSuppressionUntil = Date.now() + 1200;
+  }
+
+  async function resolveConnectionSavedSqlDir(connectionId: string): Promise<string | undefined> {
+    const globalDir = useSettingsStore().desktopSettings.saved_sql_base_dir?.trim() || undefined;
+    let override: string | null | undefined;
+    try {
+      const { useConnectionStore } = await import("@/stores/connectionStore");
+      override = useConnectionStore().getConfig(connectionId)?.saved_sql_dir;
+    } catch {
+      override = undefined;
+    }
+    const configured = override?.trim() || globalDir;
+    if (configured) return configured;
+    // Every desktop connection falls back to its own queries folder inside the
+    // app data directory, so every visible database query has a real file.
+    if (isTauriRuntime()) {
+      try {
+        return await api.defaultSavedSqlDir(connectionId);
+      } catch (error) {
+        console.warn("[DBX][saved-sql:default-dir]", error);
+      }
+    }
+    return undefined;
+  }
+
+  function isFileBacked(file: SavedSqlFile): boolean {
+    return Boolean(file.filePath);
+  }
+
+  async function resolveCatalogByDatabase(connectionId: string): Promise<Map<string, string | undefined>> {
+    const result = new Map<string, string | undefined>();
+    try {
+      const { useConnectionStore } = await import("@/stores/connectionStore");
+      const connectionStore = useConnectionStore();
+      const walk = (nodes: readonly TreeNode[]) => {
+        for (const node of nodes) {
+          if (node.type === "database" && node.connectionId === connectionId && typeof node.database === "string") {
+            if (!result.has(node.database)) result.set(node.database, node.catalog);
+          }
+          if (node.children) walk(node.children);
+          if (node.hiddenChildren) walk(node.hiddenChildren);
+        }
+      };
+      walk(connectionStore.treeNodes);
+    } catch {
+      // No tree available: scanned files materialize without a catalog.
+    }
+    return result;
+  }
+
+  function savedSqlScopeNameKey(file: Pick<SavedSqlNameScope, "connectionId" | "database" | "name">): string {
+    return JSON.stringify([file.connectionId, file.database, savedSqlNameKey(file.name)]);
+  }
+
+  /**
+   * Reconciles a connection's Navicat-style queries directory with the library:
+   * materializes every `<database>/<name>.sql` file found on disk, refreshes
+   * content of already-file-backed rows, and removes rows whose files are gone.
+   * The filesystem is the source of truth; content is read here, not stored.
+   */
+  async function refreshConnectionDir(connectionId: string) {
+    const dir = await resolveConnectionSavedSqlDir(connectionId);
+    if (!dir || !isTauriRuntime()) return;
+
+    const scanned = await api.scanSavedSqlDir(dir);
+    const scanByRel = new Map<string, { name: string; sql: string }>();
+    for (const entry of scanned) {
+      const relative = entry.relativePath.replace(/\\/g, "/");
+      if (savedSqlDatabaseFromRelativePath(relative)) scanByRel.set(relative, { name: entry.name, sql: entry.sql });
+    }
+
+    const catalogByDatabase = await resolveCatalogByDatabase(connectionId);
+    const connectionFiles = files.value.filter((file) => file.connectionId === connectionId);
+    const underThisDir = connectionFiles.filter((file) => file.filePath && savedSqlRelativeUnderDir(file.filePath, dir) !== null);
+    const rowsByRel = new Map<string, SavedSqlFile>();
+    for (const file of underThisDir) {
+      const relative = savedSqlRelativeUnderDir(file.filePath!, dir);
+      if (relative) rowsByRel.set(relative, file);
+    }
+    const rowsByScopeName = new Map<string, SavedSqlFile>();
+    for (const file of connectionFiles) {
+      if (file.database) rowsByScopeName.set(savedSqlScopeNameKey(file), file);
+    }
+
+    const timestamp = nowIso();
+    const nextRows: SavedSqlFile[] = [];
+    const consumedIds = new Set<string>();
+    const removedRows = underThisDir.filter((file) => {
+      const relative = savedSqlRelativeUnderDir(file.filePath!, dir)!;
+      return !scanByRel.has(relative);
+    });
+
+    for (const [relative, entry] of scanByRel) {
+      const database = savedSqlDatabaseFromRelativePath(relative)!;
+      const filePath = savedSqlAbsPath(dir, relative);
+      const existing = rowsByRel.get(relative) ?? rowsByScopeName.get(savedSqlScopeNameKey({ connectionId, database, name: entry.name }));
+      const changed = !existing || existing.name !== entry.name || (existing.sqlLoaded && existing.sql !== entry.sql) || (existing.filePath ?? null) !== filePath;
+      if (!existing) {
+        const row: SavedSqlFile = {
+          id: uuid(),
+          connectionId,
+          name: entry.name,
+          database,
+          catalog: catalogByDatabase.get(database),
+          sql: entry.sql,
+          sqlLoaded: true,
+          filePath,
+          orderIndex: maxOrderIndex(connectionFiles) + 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        nextRows.push(row);
+        await api.saveSavedSqlFile(row).catch((error) => console.warn("[DBX][saved-sql:dir-reconcile:create]", error));
+        continue;
+      }
+      consumedIds.add(existing.id);
+      if (!changed) {
+        nextRows.push(existing);
+        continue;
+      }
+      const updated: SavedSqlFile = {
+        ...existing,
+        name: entry.name,
+        sql: entry.sql,
+        sqlLoaded: true,
+        filePath,
+        updatedAt: timestamp,
+      };
+      nextRows.push(updated);
+      if (existing.filePath !== filePath) {
+        await api.saveSavedSqlFile(updated).catch((error) => console.warn("[DBX][saved-sql:dir-reconcile:save]", error));
+      }
+    }
+
+    // Migrate database-scoped rows that have no file yet (legacy internal
+    // queries) into real files, so every visible query has a folder location.
+    for (const row of connectionFiles) {
+      if (!row.database || row.filePath || consumedIds.has(row.id)) continue;
+      const loaded = row.sqlLoaded ? row : await api.loadSavedSqlFile(row.id).catch(() => undefined);
+      if (!loaded) {
+        nextRows.push(row);
+        consumedIds.add(row.id);
+        continue;
+      }
+      const relative = `${row.database}/${row.name}`.replace(/\\/g, "/");
+      if (scanByRel.has(relative)) {
+        nextRows.push(row);
+        consumedIds.add(row.id);
+        continue;
+      }
+      const filePath = savedSqlAbsPath(dir, relative);
+      try {
+        await api.writeSavedSqlDirFile(filePath, loaded.sql);
+        suppressDirEvents();
+        const migrated: SavedSqlFile = { ...row, sql: loaded.sql, sqlLoaded: true, filePath, updatedAt: timestamp };
+        nextRows.push(migrated);
+        await api.saveSavedSqlFile(migrated).catch((error) => console.warn("[DBX][saved-sql:dir-migrate:save]", error));
+      } catch (error) {
+        console.warn("[DBX][saved-sql:dir-migrate]", error);
+        nextRows.push(row);
+      }
+      consumedIds.add(row.id);
+    }
+
+    // Relocate rows left over from the previous default location (the app
+    // data `queries` folder) into the new default directory under Documents.
+    let legacyQueriesRoot = "";
+    try {
+      legacyQueriesRoot = `${(await api.savedSqlStorageDir()).replace(/[\\/]+$/, "")}/queries`;
+    } catch {
+      legacyQueriesRoot = "";
+    }
+    for (const row of connectionFiles) {
+      if (!row.database || !row.filePath || consumedIds.has(row.id) || !legacyQueriesRoot) continue;
+      if (savedSqlRelativeUnderDir(row.filePath, legacyQueriesRoot) === null) continue;
+      if (savedSqlRelativeUnderDir(row.filePath, dir) !== null) continue;
+      const loaded = row.sqlLoaded ? row : await api.loadSavedSqlFile(row.id).catch(() => undefined);
+      const relative = `${row.database}/${row.name}`.replace(/\\/g, "/");
+      const filePath = savedSqlAbsPath(dir, relative);
+      try {
+        await api.writeSavedSqlDirFile(filePath, loaded?.sql ?? row.sql);
+        suppressDirEvents();
+        await api.deleteSavedSqlDirFile(legacyQueriesRoot, row.filePath).catch(() => {});
+        const relocated: SavedSqlFile = { ...row, sql: loaded?.sql ?? row.sql, sqlLoaded: true, filePath, updatedAt: timestamp };
+        nextRows.push(relocated);
+        await api.saveSavedSqlFile(relocated).catch((error) => console.warn("[DBX][saved-sql:dir-relocate:save]", error));
+      } catch (error) {
+        console.warn("[DBX][saved-sql:dir-relocate]", error);
+        nextRows.push(row);
+      }
+      consumedIds.add(row.id);
+    }
+
+    const fileIdsToDelete = new Set(removedRows.map((file) => file.id));
+    for (const file of removedRows) {
+      await api.deleteSavedSqlFile(file.id).catch((error) => console.warn("[DBX][saved-sql:dir-reconcile:delete]", error));
+    }
+
+    const nextIds = new Set(nextRows.map((file) => file.id));
+    files.value = [
+      ...files.value.filter((file) => {
+        if (fileIdsToDelete.has(file.id)) return false;
+        if (nextIds.has(file.id)) return false;
+        if (file.connectionId === connectionId && file.filePath && savedSqlRelativeUnderDir(file.filePath, dir) !== null) return false;
+        return true;
+      }),
+      ...nextRows,
+    ];
+    fileDirsByConnection.set(connectionId, dir);
+    bumpVersion({ tree: true });
+    await syncToLocalDirectory();
+  }
+
+  async function startDirWatching() {
+    if (dirWatchStarted || !isTauriRuntime()) return;
+    dirWatchStarted = true;
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      await listen<string>("saved-sql-dir-changed", (event) => {
+        if (Date.now() < ownWriteSuppressionUntil) return;
+        scheduleDirRefresh(event.payload);
+      });
+    } catch (error) {
+      console.warn("[DBX][saved-sql:dir-watch:start]", error);
+    }
+  }
+
+  function scheduleDirRefresh(dir: string) {
+    const key = dir.toLowerCase();
+    const pending = dirRefreshTimers.get(key);
+    if (pending) clearTimeout(pending);
+    dirRefreshTimers.set(
+      key,
+      setTimeout(() => {
+        dirRefreshTimers.delete(key);
+        void refreshConnectionsForDir(dir);
+      }, 400),
+    );
+  }
+
+  async function refreshConnectionsForDir(dir: string) {
+    try {
+      const { useConnectionStore } = await import("@/stores/connectionStore");
+      const connectionStore = useConnectionStore();
+      for (const config of connectionStore.connections) {
+        // Resolve each connection's full directory chain (override → global →
+        // default) so events from default-location folders refresh too.
+        const resolved = await resolveConnectionSavedSqlDir(config.id).catch(() => undefined);
+        if (resolved && resolved.toLowerCase() === dir.toLowerCase()) {
+          await refreshConnectionDir(config.id).catch((error) => console.warn("[DBX][saved-sql:dir-refresh:error]", error));
+        }
+      }
+    } catch (error) {
+      console.warn("[DBX][saved-sql:dir-refresh:error]", error);
+    }
+  }
+
+  /**
+   * Copies `.sql` files from the system clipboard (or an explicit path list)
+   * into `<queries_dir>/<database>/` with Explorer-style unique naming
+   * (`test - 副本.sql`, `test - 副本 (2).sql`, ...) and refreshes the library
+   * immediately.
+   */
+  async function pasteFilesIntoDatabase(connectionId: string, database: string, paths: string[]): Promise<string[]> {
+    const dir = await resolveConnectionSavedSqlDir(connectionId);
+    if (!dir || !isTauriRuntime() || paths.length === 0) return [];
+    const taken = new Set(files.value.filter((file) => file.connectionId === connectionId && file.database === database).map((file) => file.name));
+    const created: string[] = [];
+    for (const path of paths) {
+      const sourceName = path.split(/[\\/]/).pop() || "query.sql";
+      const targetName = nextSavedSqlCopyName(sourceName, taken);
+      taken.add(targetName);
+      try {
+        suppressDirEvents();
+        const target = await api.pasteSavedSqlFile(dir, database, path, targetName);
+        created.push(target);
+      } catch (error) {
+        console.warn("[DBX][saved-sql:paste-file]", error);
+      }
+    }
+    if (created.length > 0) {
+      await refreshConnectionDir(connectionId).catch((error) => console.warn("[DBX][saved-sql:paste-refresh]", error));
+    }
+    return created;
+  }
+
+  /** (Re)wires directory watching and refresh for every configured connection. */
+  async function reconcileFileBackedDirectories() {
+    await startDirWatching();
+    if (!isTauriRuntime()) return;
+    // Directory reconciliation must see the loaded library, otherwise it would
+    // migrate/relocate against an empty file list.
+    if (!isLoaded.value) {
+      await initFromStorage();
+    }
+    try {
+      const { useConnectionStore } = await import("@/stores/connectionStore");
+      const connectionStore = useConnectionStore();
+      const wanted = new Set<string>();
+      for (const config of connectionStore.connections) {
+        const dir = await resolveConnectionSavedSqlDir(config.id).catch(() => undefined);
+        if (!dir) continue;
+        wanted.add(dir);
+        await api.watchSavedSqlDir(dir).catch(() => {});
+        await refreshConnectionDir(config.id).catch((error) => console.warn("[DBX][saved-sql:dir-init:error]", error));
+      }
+      for (const dir of watchedDirs) {
+        if (!wanted.has(dir)) {
+          await api.unwatchSavedSqlDir(dir).catch(() => {});
+        }
+      }
+      watchedDirs.clear();
+      for (const dir of wanted) watchedDirs.add(dir);
+    } catch (error) {
+      console.warn("[DBX][saved-sql:dir-init:error]", error);
+    }
+  }
+
   const version = ref(0);
   const treeVersion = ref(0);
   function bumpVersion(options: { tree?: boolean } = {}) {
@@ -257,6 +632,16 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   async function ensureFileContent(id: string) {
     const existing = getFile(id);
     if (!existing) return undefined;
+    if (existing.filePath && isTauriRuntime()) {
+      try {
+        const sql = await api.readSavedSqlDirFile(existing.filePath);
+        const hydrated = { ...existing, sql, sqlLoaded: true };
+        files.value = files.value.map((file) => (file.id === id ? hydrated : file));
+        return hydrated;
+      } catch (error) {
+        console.warn("[DBX][saved-sql:file-read:error]", error);
+      }
+    }
     if (existing.sqlLoaded !== false) return existing;
 
     const loaded = await api.loadSavedSqlFile(id);
@@ -312,6 +697,13 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   async function deleteFolder(id: string) {
     const removedIds = descendantFolderIds(id);
     const removesFiles = files.value.some((file) => !!file.folderId && removedIds.has(file.folderId));
+    for (const file of files.value.filter((file) => file.folderId && removedIds.has(file.folderId))) {
+      if (file.filePath && isTauriRuntime()) {
+        const dir = fileDirsByConnection.get(file.connectionId) ?? savedSqlDirFromFilePath(file.filePath);
+        suppressDirEvents();
+        await api.deleteSavedSqlDirFile(dir, file.filePath).catch((error) => console.warn("[DBX][saved-sql:file-delete:error]", error));
+      }
+    }
     await api.deleteSavedSqlFolder(id);
     folders.value = folders.value.filter((folder) => !removedIds.has(folder.id));
     files.value = files.value.filter((file) => !file.folderId || !removedIds.has(file.folderId));
@@ -324,13 +716,16 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     const existing = input.id ? getFile(input.id) : undefined;
     const catalog = normalizedCatalog(input.catalog);
     const hasFolderIdInput = Object.prototype.hasOwnProperty.call(input, "folderId");
+    const invalidReason = invalidSavedSqlNameReason(input.name);
+    if (invalidReason) throw new SavedSqlInvalidNameError(input.name, invalidReason);
+    const safeName = ensureSqlExtension(input.name.trim());
     const file: SavedSqlFile = existing
       ? {
           ...existing,
           // Partial metadata updates should not move files out of their folder.
           // Callers that intentionally move to root pass `folderId: undefined`.
           folderId: hasFolderIdInput ? input.folderId || undefined : existing.folderId,
-          name: input.name,
+          name: safeName,
           database: input.database,
           schema: input.schema,
           sql: input.sql,
@@ -344,7 +739,7 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
           connectionId: input.connectionId,
           catalog,
           folderId: input.folderId || undefined,
-          name: input.name,
+          name: safeName,
           database: input.database,
           schema: input.schema,
           sql: input.sql,
@@ -356,7 +751,8 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     const nameIdentityChanged = !existing || savedSqlNameIdentity(existing) !== savedSqlNameIdentity(file);
     const releaseName = nameIdentityChanged ? reserveFileName(file) : undefined;
     try {
-      const saved = normalizeSavedSqlFile(await api.saveSavedSqlFile(file));
+      const filePath = await persistFileToDisk(input.connectionId, file, existing);
+      const saved = normalizeSavedSqlFile(await api.saveSavedSqlFile({ ...file, filePath }));
       files.value = [...files.value.filter((item) => item.id !== saved.id), { ...saved, sqlLoaded: true }];
       bumpVersion({ tree: !existing || savedSqlTreeIdentity(existing) !== savedSqlTreeIdentity(saved) });
       await syncToLocalDirectory();
@@ -364,6 +760,25 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     } finally {
       releaseName?.();
     }
+  }
+
+  /**
+   * Writes a database-scoped query to its Navicat-style directory and returns
+   * the file path. Internal (library) files are left untouched.
+   */
+  async function persistFileToDisk(connectionId: string, file: SavedSqlFile, existing?: SavedSqlFile): Promise<string | null> {
+    if (!isTauriRuntime() || !file.database) return existing?.filePath ?? null;
+    const dir = (await resolveConnectionSavedSqlDir(connectionId)) || (existing?.filePath ? savedSqlDirFromFilePath(existing.filePath) : undefined);
+    if (!dir) return existing?.filePath ?? null;
+
+    const candidatePath = savedSqlAbsPath(dir, `${file.database}/${file.name}`);
+    const previousPath = existing?.filePath ?? null;
+    suppressDirEvents();
+    if (previousPath && previousPath.toLowerCase() !== candidatePath.toLowerCase()) {
+      await api.renameSavedSqlDirFile(dir, previousPath, candidatePath);
+    }
+    await api.writeSavedSqlDirFile(candidatePath, file.sql);
+    return candidatePath;
   }
 
   function updateFileExecutionTarget(id: string, target: SavedSqlExecutionTargetInput): Promise<SavedSqlFile | undefined> {
@@ -458,12 +873,24 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   async function renameFile(id: string, name: string) {
     const existing = getFile(id);
     if (!existing) return;
-    const normalizedName = ensureSqlExtension(name);
+    const invalidReason = invalidSavedSqlNameReason(name);
+    if (invalidReason) throw new SavedSqlInvalidNameError(name, invalidReason);
+    const normalizedName = ensureSqlExtension(name.trim());
     if (normalizedName === existing.name) return existing;
     const candidate = { ...existing, name: normalizedName, updatedAt: nowIso() };
     const releaseName = reserveFileName(candidate);
     try {
-      const saved = normalizeSavedSqlFile(await api.saveSavedSqlFile(candidate));
+      let nextFilePath = existing.filePath ?? null;
+      if (existing.filePath && existing.database && isTauriRuntime()) {
+        const dir = fileDirsByConnection.get(existing.connectionId) ?? savedSqlDirFromFilePath(existing.filePath);
+        const targetPath = savedSqlAbsPath(dir, `${existing.database}/${normalizedName}`);
+        suppressDirEvents();
+        if (existing.filePath.toLowerCase() !== targetPath.toLowerCase()) {
+          await api.renameSavedSqlDirFile(dir, existing.filePath, targetPath);
+        }
+        nextFilePath = targetPath;
+      }
+      const saved = normalizeSavedSqlFile(await api.saveSavedSqlFile({ ...candidate, filePath: nextFilePath }));
       files.value = files.value.map((file) => (file.id === id ? { ...saved, sql: file.sql, sqlLoaded: file.sqlLoaded } : file));
       bumpVersion({ tree: true });
 
@@ -532,6 +959,12 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
   }
 
   async function deleteFile(id: string) {
+    const existing = getFile(id);
+    if (existing?.filePath && isTauriRuntime()) {
+      const dir = fileDirsByConnection.get(existing.connectionId) ?? savedSqlDirFromFilePath(existing.filePath);
+      suppressDirEvents();
+      await api.deleteSavedSqlDirFile(dir, existing.filePath).catch((error) => console.warn("[DBX][saved-sql:file-delete:error]", error));
+    }
     await api.deleteSavedSqlFile(id);
     files.value = files.value.filter((file) => file.id !== id);
     bumpVersion({ tree: true });
@@ -841,6 +1274,11 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     moveFileToFolder,
     moveFilesToFolder,
     syncToLocalDirectory,
+    refreshConnectionDir,
+    reconcileFileBackedDirectories,
+    pasteFilesIntoDatabase,
+    isFileBacked,
+    resolveConnectionSavedSqlDir,
     allFolders,
     allFoldersTreeOrder,
     allFiles,
